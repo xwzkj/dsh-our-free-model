@@ -82,6 +82,13 @@ assert.deepEqual(routeCandidates(pool2, { now }).map(r => r.name), ['direct', 'h
 noteNode429(pool2, 'hk', now - HOUR)
 assert.deepEqual(routeCandidates(pool2, { now }).map(r => r.name), ['direct', 'jp'], 'the limited node drops out, direct is unaffected')
 
+// A node whose only reading is a failure must not rank as "0 ms".
+const mixed = emptyNodeTable()
+noteNodeDelay(mixed, 'dead', 0, now - 30 * 60_000)
+noteNodeDelay(mixed, 'alive', 221, now)
+assert.deepEqual(routeCandidates(mixed, { now }).map(r => r.name), ['direct', 'alive', 'dead'],
+  'an unmeasured node sorts last, never first')
+
 // Everything cooling is an empty list — the caller decides what to retry.
 const dead = emptyNodeTable()
 noteNodeDelay(dead, 'a', 100, now)

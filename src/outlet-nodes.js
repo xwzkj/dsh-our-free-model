@@ -196,11 +196,17 @@ export function routeCandidates(table, {
     if (failMs === 0 ? lastFailAt > 0 : lastFailAt > 0 && now - lastFailAt < failMs) continue
     routes.push({ name, delayMs: Number(entry.delayMs) || 0, direct: false })
   }
+  // Direct first, then measured nodes by latency, then everything unmeasured.
+  //
+  // The last group matters: a node whose only reading is a failure has
+  // `delayMs === 0`, and sorting raw numbers put those first — a dead node
+  // ranked ahead of a 200 ms one and every turn went to it. "No measurement" is
+  // the absence of a hint, never a zero latency.
+  const rank = route => (route.direct ? -1 : route.delayMs > 0 ? route.delayMs : Number.MAX_SAFE_INTEGER)
   routes.sort((a, b) => {
-    if (a.delayMs !== b.delayMs) return a.delayMs - b.delayMs
-    // Equal latency: direct first, it is the cheapest to use. Node names break
-    // the remaining ties so the order is stable between turns.
-    if (a.direct !== b.direct) return a.direct ? -1 : 1
+    const left = rank(a)
+    const right = rank(b)
+    if (left !== right) return left - right
     return a.name.localeCompare(b.name)
   })
   return routes

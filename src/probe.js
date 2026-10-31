@@ -67,6 +67,11 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
       attributionUserAgent,
       signal,
       timeoutMs,
+      // A probe may walk the same fallback ladder a turn does, but its 429 must
+      // not stamp a five-hour cooldown: one probe round is 36 requests, and if a
+      // pool is genuinely spent they would burn every node in seconds — the
+      // cascade that left three paths stamped and the roster short.
+      probe: true,
       onData: payload => {
         // The lane answers some refusals inside a 200 stream — a `{"type":
         // "error"}` or `{"error": …}` frame arrives where the deltas were

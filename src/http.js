@@ -23,7 +23,7 @@
  */
 
 import { CLIENT_UA, UPSTREAM_BASE, gatewayHeaders, mintSessionId, truncateSession } from './upstream.js'
-import { applyOutletNode, egressFetch, egressPolicy, markOutlet429, markOutletSuccess, outletRoutePlan } from './egress.js'
+import { applyOutletNode, egressFetch, egressPolicy, markOutlet429, markOutletFailure, markOutletSuccess, outletRoutePlan } from './egress.js'
 import { DIRECT_ROUTE } from './outlet-nodes.js'
 import { logFailureNote, logUpstreamFailure, publicMessageFor } from './failure.js'
 
@@ -347,7 +347,7 @@ async function headRead(reader, signal, deadline) {
   let onAbort
   const pending = reader.read()
   const halted = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new UpstreamError('upstream sent no bytes before its deadline', CODE.timeout)),
+    timer = setTimeout(() => reject(new UpstreamError('upstream sent no bytes before its deadline', CODE.timeout, { beforeHead: true })),
       Math.max(0, deadline - Date.now()))
     timer.unref?.()
     onAbort = () => {
@@ -524,18 +524,31 @@ export async function postStreamed(options) {
       lastError = error
       // 429 is a verdict on the exit address — direct included, which is why it
       // has an entry of its own in the book.
-      if (error?.status === 429) {
-        if (route.kind === 'direct') markOutlet429(DIRECT_ROUTE)
-        else if (pinned) markOutlet429(route.node)
+      // Only real traffic writes a cooldown: a probe finding a 429 is evidence,
+      // but 36 of them would cool the whole pool on one spent exit.
+      if (options.probe !== true) {
+        if (error?.status === 429) {
+          if (route.kind === 'direct') markOutlet429(DIRECT_ROUTE)
+          else if (pinned) markOutlet429(route.node)
+        } else if (error?.beforeHead === true && pinned) {
+          // A path that drops the connection is marked too, or the next turn
+          // picks the same dead node first — its latency reading is still good.
+          markOutletFailure(route.node)
+        }
       }
       const next = routes[index + 1]
-      if (error?.status !== 429 || next === undefined) throw error
+      // 429 is the documented reason to change exit; a connection dropped before
+      // any byte is the other one — the path is blocked, not the request. Both
+      // cost nothing to retry elsewhere (the rung already replayed itself once).
+      const reroutable = error?.status === 429 || error?.beforeHead === true
+      if (!reroutable || next === undefined) throw error
       // The refused attempt spent nothing (nothing was generated), so this is
       // the one retry that is free. The raw sentence is already in the log;
       // this line records which route refused and where the turn goes next.
       const from = route.kind === 'direct' ? 'the direct route' : `"${route.node}"`
       const to = next.kind === 'direct' ? 'the direct route' : next.kind === 'relay' ? 'the outlet' : `"${next.node}"`
-      logFailureNote(`${error.code} from ${from}; retrying over ${to} with a fresh session`)
+      const why = error.status === 429 ? error.code : 'connection dropped'
+      logFailureNote(`${why} from ${from}; retrying over ${to} with a fresh session`)
     }
   }
   if (lastError !== undefined) throw lastError
@@ -568,7 +581,9 @@ async function postStreamedOnce({ path, body, session, attributionUserAgent, sig
     if (response === undefined) {
       const cause = isHeadReset(retried) ? ' (the gateway reset the connection before answering)' : transportCause(retried)
       throw logAndReturn(new UpstreamError(publicMessageFor({ code: CODE.transport }), CODE.transport,
-        { rawMessage: `upstream request failed: ${retried?.message ?? retried}${cause}` }))
+        // Nothing came back, so nothing was generated and nothing was spent:
+        // the caller may move this turn to another exit.
+        { beforeHead: true, rawMessage: `upstream request failed: ${retried?.message ?? retried}${cause}` }))
     }
   }
 

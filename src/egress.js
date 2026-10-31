@@ -184,6 +184,19 @@ export function markOutlet429(name, relay = activeRelay) {
 }
 
 /**
+ * The connection through `name` was dropped before any byte came back.
+ *
+ * Ten minutes, not five hours: a reset says the path is unusable right now, not
+ * that an address is out of quota. Without this the same dead node is picked
+ * first on the next turn, because its latency reading still says it is fast.
+ */
+export function markOutletFailure(name, relay = activeRelay) {
+  if (relay === null || typeof name !== 'string' || name === '') return
+  noteNodeDelay(relay.nodes, name, 0)
+  persistNodes(relay)
+}
+
+/**
  * The turn was served through `name`: clear its failure counter.
  *
  * Memory only, on purpose — this runs once per served turn and the book is
