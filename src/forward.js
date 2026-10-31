@@ -40,6 +40,7 @@ import { toMessagesResponse, tryOptimizations } from './local-optimize.js'
 import { carryFailure, forwardFailure } from './failure.js'
 import { deferStreamResponse } from './deferred-response.js'
 import { geminiEndpoint, geminiError, geminiRoute } from './gemini.js'
+import { createSessionAffinity } from './session-affinity.js'
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024
 const REQUEST_ID_HEADER = 'x-ofm-request-id'
@@ -321,9 +322,17 @@ export async function bindForwardPort(server, { address, port, attempts = BIND_A
  * @param {(event: object) => void} [options.onTrace] - bounded request diagnostics, separate from warnings
  * @param {() => object} [options.health] - 健康应答由各产品入口注入，默认保持插件兼容。
  * @param {(req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>} [options.handleRequest] - 产品附加路由，返回 true 表示已处理。
+ * @param {string} [options.dataDir] - 传入后才启用按会话保持；表文件落在该目录，两个产品入口都会传。
  * @returns {Promise<{server: http.Server, port: number, close: () => Promise<void>}>}
  */
-export async function startForwardServer({ config, complete, modelRows, log = () => {}, onTrace = () => {}, heartbeatMs = SSE_HEARTBEAT_MS, optimize = null, health = () => ({ ok: true, service: 'our-free-model' }), handleRequest }) {
+export async function startForwardServer({ config, complete, modelRows, log = () => {}, onTrace = () => {}, heartbeatMs = SSE_HEARTBEAT_MS, optimize = null, health = () => ({ ok: true, service: 'our-free-model' }), handleRequest, dataDir }) {
+  // Session affinity is a product-level feature: only a caller that names its
+  // data directory gets it (both products do; offline tests and ad-hoc
+  // embedders keep the historical one-session behaviour).
+  const affinity = dataDir === undefined ? null : createSessionAffinity({
+    dataDir,
+    ...(config().sessionAffinity ?? {}),
+  })
   const server = http.createServer((req, res) => {
     const trace = traceRequest(req, res, 'forward', onTrace)
     void handle(req, res, trace).catch(error => {
@@ -374,7 +383,7 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
       return
     }
     if (gemini) {
-      await serveCompletion(req, res, complete, geminiEndpoint({ readBody, json, modelRows, route: gemini, url }), heartbeatMs, trace)
+      await serveCompletion(req, res, complete, geminiEndpoint({ readBody, json, modelRows, route: gemini, url, affinity }), heartbeatMs, trace)
       return
     }
     if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) {
@@ -382,15 +391,15 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
       return
     }
     if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/chat/completions')) {
-      await serveCompletion(req, res, complete, chatCompletions, heartbeatMs, trace, { optimize })
+      await serveCompletion(req, res, complete, chatCompletions, heartbeatMs, trace, { optimize, affinity })
       return
     }
     if (req.method === 'POST' && (path === '/v1/responses' || path === '/responses')) {
-      await serveCompletion(req, res, complete, responsesEndpoint, heartbeatMs, trace, { optimize })
+      await serveCompletion(req, res, complete, responsesEndpoint, heartbeatMs, trace, { optimize, affinity })
       return
     }
     if (req.method === 'POST' && (path === '/v1/messages' || path === '/messages')) {
-      await serveCompletion(req, res, complete, messagesEndpoint, heartbeatMs, trace, { optimize })
+      await serveCompletion(req, res, complete, messagesEndpoint, heartbeatMs, trace, { optimize, affinity })
       return
     }
     if (req.method === 'POST' && (path === '/v1/messages/count_tokens' || path === '/messages/count_tokens')) {
@@ -425,6 +434,7 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
     /** The address actually bound, so a caller can tell a restart from a no-op. */
     host: config().host || '127.0.0.1',
     close: () => new Promise(resolve => {
+      affinity?.close()
       server.closeAllConnections?.()
       server.close(() => resolve())
     }),
@@ -838,9 +848,11 @@ async function chatCompletions(req, res, complete, options = {}) {
   if (effort !== undefined) body.reasoning_effort = effort
 
   const tools = createToolWire(body)
+  // A thunk: the completion resolves it only for lanes that spend a session.
+  const sessionKey = () => options.affinity?.resolve(req, body, { apiKey: bearerOf(req) })
 
   if (!wantsStream) {
-    const outcome = await complete({ model, openAi: body })
+    const outcome = await complete({ model, openAi: body, sessionKey })
     // 截断或恢复失败即使已有部分正文，也不能返回正常完成。
     if (outcome.error !== undefined) {
       failureReply(res, outcome, false, true)
@@ -872,7 +884,7 @@ async function chatCompletions(req, res, complete, options = {}) {
   sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })
   let outcome
   try {
-    outcome = await complete({ model, openAi: body }, (chunk) => {
+    outcome = await complete({ model, openAi: body, sessionKey }, (chunk) => {
       if (res.destroyed) return
       if (chunk.type === 'text-delta') {
         sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }] })
@@ -1045,6 +1057,7 @@ async function responsesEndpoint(req, res, complete, options = {}) {
   }
 
   const tools = createToolWire(openAi)
+  const sessionKey = () => options.affinity?.resolve(req, openAi, { apiKey: bearerOf(req) })
   const status = outcome => outcome.truncated === true ? 'incomplete' : 'completed'
   const incompleteDetails = outcome => outcome.truncated === true ? { reason: 'max_output_tokens' } : undefined
   const outputRows = outcome => [
@@ -1097,7 +1110,7 @@ async function responsesEndpoint(req, res, complete, options = {}) {
     let usage
     let outcome
     try {
-      outcome = await complete({ model, openAi, responses: true, responsesBody: body }, (chunk) => {
+      outcome = await complete({ model, openAi, sessionKey, responses: true, responsesBody: body }, (chunk) => {
         if (res.destroyed) return
         if (chunk.type === 'text-delta') {
           announceMessage()
@@ -1192,7 +1205,7 @@ async function responsesEndpoint(req, res, complete, options = {}) {
     return
   }
 
-  const outcome = await complete({ model, openAi, responses: true, responsesBody: body })
+  const outcome = await complete({ model, openAi, sessionKey, responses: true, responsesBody: body })
   if (outcome.error !== undefined) {
     failureReply(res, outcome, false, true)
     return
@@ -1287,6 +1300,7 @@ async function messagesEndpoint(req, res, complete, options = {}) {
     model,
     messages,
     tools: parsed.tools,
+    sessionKey: () => options.affinity?.resolve(req, body, { apiKey: bearerOf(req) }),
     ...parsed.toolChoice === undefined ? {} : { toolChoice: parsed.toolChoice },
     ...parsed.maxTokens === undefined ? {} : { maxTokens: parsed.maxTokens },
     ...parsed.temperature === undefined ? {} : { temperature: parsed.temperature },

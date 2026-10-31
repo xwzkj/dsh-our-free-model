@@ -272,7 +272,7 @@ function estimate(request) {
 }
 
 /** Factory injects the gateway's bounded reader and existing response helpers. */
-export function geminiEndpoint({ readBody, json, modelRows, route, url }) {
+export function geminiEndpoint({ readBody, json, modelRows, route, url, affinity = null }) {
   return async (req, res, complete) => {
     // Provider errors can contain a URL. Redact every presented credential,
     // including its percent-encoded spelling, and never pass errors to logging.
@@ -317,6 +317,9 @@ export function geminiEndpoint({ readBody, json, modelRows, route, url }) {
         body = body.generateContentRequest
       }
       const request = fromGeminiRequest(body, route.model)
+      request.sessionKey = () => affinity?.resolve(req, body, {
+        apiKey: req.headers['x-goog-api-key'] ?? req.headers['x-api-key'] ?? url.searchParams.get('key') ?? '',
+      })
       if (route.method === 'countTokens') {
         res.setHeader('x-ofm-token-count-estimated', 'true')
         json(res, 200, { totalTokens: estimate(request) })

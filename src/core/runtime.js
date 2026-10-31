@@ -11,7 +11,7 @@ import { runModelTest, modelAvailability } from '../model-test.js'
 import { DEFAULT_LEVEL } from '../effort.js'
 import { fetchSealedListing } from '../eac.js'
 import { fetchKiloListing } from '../kilo.js'
-import { sessionForConversation } from '../upstream.js'
+import { configureSessionStore, sessionForConversation } from '../upstream.js'
 import { createForwardCompletion, publicModelRows } from './completion.js'
 import { isSubscriptionEntry, subscriptionCatalog } from '../subscription-adapter.js'
 
@@ -27,6 +27,9 @@ export function createRuntimeStores({ dataDir, logger = console }) {
     throw new TypeError('dataDir must be an absolute path')
   }
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+  // The upstream session map belongs to this product's data directory. Callers
+  // that never configure it (older embedders) keep the plugin's DSH default.
+  configureSessionStore(dataDir)
   const open = (file, initial) => new JsonStore(path.join(dataDir, file), structuredClone(initial), {
     log: message => logger.warn?.(message),
   })

@@ -135,6 +135,20 @@ Chat Completions、Responses API，以及独立网页管理（模型、统计、
 > 其它渠道出现的同名包一律以本仓库为准。
 
 
+**运行前提：本机 Bun（仅 OC 免费车道需要）**
+
+OC 免费车道的上游有一道客户端闸门，实测要**同时**满足两点：请求由 Bun 的 HTTP/TLS
+栈发出，且上游请求是流式（`stream: true`）。插件本来就这么发（Bun worker + SSE；
+下游客户端可以是非流式，适配器始终流式请求上游），所以装好 Bun 即可。查找顺序：
+`OUR_FREE_MODEL_BUN` → `BUN_INSTALL/bin` → `~/.bun/bin` → `PATH`。没有 Bun 时插件仍能
+启动，但免费车道报 `OpenCode free inference requires a local Bun executable…`。
+
+2026-10-31 同机同出口复测：Bun + 流式 3/3 成功；Bun 非流式、Node 流式、Node 非流式
+全部返回 429 `FreeUsageLimitError`。该报错正文写“免费额度用尽”，实际是客户端闸门，
+不是真的额度耗尽。`OUR_FREE_MODEL_FREE_TRANSPORT=node` 只用于诊断，跑不了 OC 车道。
+Kilo 车道不需要 Bun。独立服务同理，见
+[独立服务说明](packages/standalone/README.md#免费车道的出网传输bun-或-node)。
+
 **命令行（纯 dsh web）**
 
 ```

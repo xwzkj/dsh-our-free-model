@@ -41,6 +41,58 @@ npm run start:standalone -- --port 18900 --data-dir F:\ofm-data
 插件仍使用 `DSH_HOME/our-free-model` 或 `~/.dsh/our-free-model`，两者默认互不影响。
 不要主动把独立服务的 `OFM_HOME` 指向插件的数据目录。
 
+### 免费车道的出网传输（Bun 或 Node）
+
+OpenCode 免费车道的请求默认交给本机 Bun 可执行文件发送，插件本身不下载任何东西。
+查找顺序：`OUR_FREE_MODEL_BUN`、`BUN_INSTALL/bin`、`~/.bun/bin`、`PATH`。
+没有 Bun 时服务仍能启动，但模型清单刷新会报
+`OpenCode free inference requires a local Bun executable…`，免费车道不可用。两种处理：
+
+1. 安装 Bun（独立安装，或用 `OUR_FREE_MODEL_BUN` 指向原生可执行文件）；
+2. 设置 `OUR_FREE_MODEL_FREE_TRANSPORT=node`，走 Node 的旧传输。这是上游保留的
+   诊断/回退路径；**不要把 Node 回退当成可用的 OC 通道**。
+
+2026-10-31 在同一台机器、同一出口复测，闸门要**同时**满足两个条件：
+
+| 传输 | 上游流式 | 结果 |
+| --- | --- | --- |
+| Bun | `stream: true` | 3/3 成功 |
+| Bun | `stream: false` | 429 `FreeUsageLimitError` |
+| Node | `stream: true` | 429 |
+| Node | `stream: false` | 429 |
+
+插件向上游始终发流式请求（下游客户端可以是非流式），所以装好 Bun 即满足两个条件。
+报错正文写“免费额度用尽”是误导，它同时被用作客户端闸门的拒绝文案；先确认没开
+`node` 回退，再怀疑额度。`OUR_FREE_MODEL_FREE_TRANSPORT=node` 只用于诊断。
+Kilo 车道不需要 Bun，两条传输都正常。
+
+## 会话保持（每个对话独立的上游会话）
+
+免费车道按上游会话区分状态与额度。独立服务不会再把所有下游请求塞进同一个
+`forward:shared`，而是给每个对话分配并复用各自的 `ses_…`：
+
+- 键的优先级：请求头 `session-id` / `session_id` / `x-session-id` /
+  `conversation-id` / `conversation_id` / `x-conversation-id` →
+  请求体 `metadata.session_id`、`session_id`、`conversation_id`、
+  `conversation`、`chat_id`、`prompt_cache_key` → Claude Code
+  `metadata.user_id` 尾部的 `_session_<uuid>` → `user` 字段 → API Key + 模型 +
+  首条用户消息的指纹（没有携带任何标识的客户端也能按对话分开）。
+- 同一个键在 30 分钟空闲内复用同一个上游会话；超过 TTL 或表满（LRU，默认 1024
+  条）后换新会话。
+- 状态写在数据目录的 `session-affinity.json` 与 `session-map.json`，重启后保持；
+  独立服务不再写入 `~/.dsh`。
+- 配置在 `settings.json`：
+
+  ```json
+  "sessionAffinity": { "enabled": true, "ttlMinutes": 30, "maxEntries": 1024 }
+  ```
+
+  环境变量覆盖：`OFM_SESSION_AFFINITY=0` 关闭，`OFM_SESSION_TTL_MINUTES`、
+  `OFM_SESSION_MAX` 调整。关闭后回到按 `user` 分桶的历史行为。
+
+会话保持只解决“不同对话共用一个上游会话”的问题，不放宽上游的限额与条款：
+同一出口 IP 的 429 不会因为换会话而消失；Kilo 免费池的提示词仍可能被上游记录。
+
 ## 局域网推理
 
 首次启动默认关闭。可在本机管理接口中设置，或通过 CLI 显式开启并保存：

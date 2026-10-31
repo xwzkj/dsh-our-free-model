@@ -549,9 +549,13 @@ export function apply(ctx, config) {
     }
     try {
       forward = await startForwardServer({
+        dataDir,
         config: () => {
           const current = settings.get().forward ?? {}
-          return { host: current.host || '127.0.0.1', port: current.port ?? 0, enabled: current.enabled === true, key: forwardKey() }
+          return {
+            host: current.host || '127.0.0.1', port: current.port ?? 0, enabled: current.enabled === true, key: forwardKey(),
+            sessionAffinity: settings.get().sessionAffinity,
+          }
         },
         complete: (request, onChunk) => runForwarded(request, onChunk),
         modelRows: () => publicModelRows(),

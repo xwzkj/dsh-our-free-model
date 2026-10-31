@@ -226,10 +226,36 @@ export function mintRequestId(timestamp = Date.now()) {
 }
 
 const SESSION_MAP_FILE = 'session-map.json'
+/** Bounded so a long-lived service cannot grow the map without limit. */
+const MAX_REMEMBERED_SESSIONS = 8192
 let sessions
+let sessionDir
+
+/**
+ * Point the session map at the product's own data directory.
+ *
+ * Both entry points call this from `createRuntimeStores`; before it existed the
+ * map always landed under `$DSH_HOME/our-free-model`, which meant a standalone
+ * service wrote state into the plugin's directory (and could not be relocated
+ * with `--data-dir`). The plugin's default is unchanged.
+ */
+export function configureSessionStore(dir) {
+  if (typeof dir !== 'string' || !path.isAbsolute(dir)) {
+    throw new TypeError('session store directory must be an absolute path')
+  }
+  const resolved = path.resolve(dir)
+  if (sessionDir === resolved) return
+  sessionDir = resolved
+  // Reload from the new location on the next request; an already-loaded map
+  // belongs to the previous product.
+  sessions = undefined
+}
 
 function sessionStorePath() {
-  try { return path.join(path.resolve(resolveDshHome(), DATA_DIR_NAME), SESSION_MAP_FILE) } catch { return undefined }
+  try {
+    const dir = sessionDir ?? path.join(resolveDshHome(), DATA_DIR_NAME)
+    return path.join(dir, SESSION_MAP_FILE)
+  } catch { return undefined }
 }
 
 function loadSessions() {
@@ -247,13 +273,33 @@ function loadSessions() {
 }
 
 function rememberSession(seed, id) {
-  loadSessions().set(seed, id)
+  const store = loadSessions()
+  // Map order is the eviction order: drop the oldest seed, not the one in use.
+  store.delete(seed)
+  store.set(seed, id)
+  while (store.size > MAX_REMEMBERED_SESSIONS) store.delete(store.keys().next().value)
+  persistSessions()
+}
+
+/** Forget one seed's upstream id (session affinity expiry / LRU eviction). */
+export function forgetSession(seed) {
+  if (typeof seed !== 'string' || seed === '') return
+  const store = loadSessions()
+  if (!store.delete(seed)) return
+  persistSessions()
+}
+
+function persistSessions() {
   try {
     const file = sessionStorePath()
     if (file === undefined) return
-    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
     const temp = `${file}.tmp`
-    fs.writeFileSync(temp, JSON.stringify({ version: 2, at: Date.now(), sessions: Object.fromEntries(sessions) }, undefined, 2))
+    fs.writeFileSync(temp, JSON.stringify({
+      version: 2,
+      at: Date.now(),
+      sessions: Object.fromEntries(sessions),
+    }, undefined, 2), { mode: 0o600 })
     fs.renameSync(temp, file)
   } catch { /* non-fatal: the id still works, it just will not survive a restart */ }
 }

@@ -68,7 +68,14 @@ export function createForwardCompletion({ adapter, state, signal }) {
       ...maxTokens === undefined ? {} : { maxTokens },
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
       ...toolChoice === undefined ? {} : { toolChoice },
-      sessionId: `forward:${String(openAi.user ?? openAi.conversation ?? request.sessionId ?? 'shared')}`,
+      // Only the OpenCode free lane spends a per-session quota; the absorbed
+      // channels (Kilo/EAC/aggregate/subscription) carry their own auth and do
+      // not use the id, so they must not mint affinity-table entries either.
+      // The listener passes a thunk so non-free lanes never pay for a lookup.
+      ...entry.channel === undefined ? {
+        sessionId: (typeof request.sessionKey === 'function' ? request.sessionKey() : request.sessionKey)
+          ?? `forward:${String(openAi.user ?? openAi.conversation ?? request.sessionId ?? 'shared')}`,
+      } : {},
       signal: request.signal && signal ? AbortSignal.any([request.signal, signal]) : request.signal ?? signal,
     }
     for await (const chunk of adapter.stream(options, entry, snapshot)) {

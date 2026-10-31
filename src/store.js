@@ -178,6 +178,15 @@ export const SETTINGS_INITIAL = {
      *  binds a routable address, and demands a key of its own (`forwardLanKey`). */
     lan: { enabled: false, port: 0 },
   },
+  /** Session affinity for forwarded API traffic (new-api style).
+   *
+   *  Each downstream conversation is pinned to its own upstream `ses_…` id, so
+   *  conversations do not share one quota bucket. The key comes from a request
+   *  header / body identifier, else a fingerprint of the first user turn; an
+   *  idle key expires after `ttlMinutes` and the next request mints a new
+   *  session. `maxEntries` bounds the LRU table. Env overrides:
+   *  `OFM_SESSION_AFFINITY=0`, `OFM_SESSION_TTL_MINUTES`, `OFM_SESSION_MAX`. */
+  sessionAffinity: { enabled: true, ttlMinutes: 30, maxEntries: 1024 },
   /** Route inference/probe traffic through an outlet. `mode: 'subscription'`
    *  spawns a local mihomo that load-balances a Clash subscription; `mode:
    *  'client'` dials one http/https/socks5/socks5h URL directly. Off by

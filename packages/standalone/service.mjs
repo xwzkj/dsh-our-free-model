@@ -304,7 +304,11 @@ export async function startStandalone({
       },
     })
     listener = await startForwardServer({
-      config: () => ({ host, port: requestedPort, enabled: settings.get().enabled !== false, key: settings.get().forwardKey }),
+      dataDir,
+      config: () => ({
+        host, port: requestedPort, enabled: settings.get().enabled !== false, key: settings.get().forwardKey,
+        sessionAffinity: settings.get().sessionAffinity,
+      }),
       complete: runtime.complete,
       modelRows: runtime.publicModelRows,
       health: () => ({
