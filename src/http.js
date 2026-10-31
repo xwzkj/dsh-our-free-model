@@ -22,8 +22,10 @@
  * @module src/http.js
  */
 
-import { CLIENT_UA, UPSTREAM_BASE, gatewayHeaders, truncateSession } from './upstream.js'
-import { egressFetch } from './egress.js'
+import { CLIENT_UA, UPSTREAM_BASE, gatewayHeaders, mintSessionId, truncateSession } from './upstream.js'
+import { applyOutletNode, egressFetch, egressPolicy, markOutlet429, markOutletSuccess, outletRoutePlan } from './egress.js'
+import { DIRECT_ROUTE } from './outlet-nodes.js'
+import { logFailureNote, logUpstreamFailure, publicMessageFor } from './failure.js'
 
 /** Harness-neutral failure codes (packages/llm/llm/src/error.ts vocabulary; CLIENT_ERROR extends it like CONFIG_DISABLED does). */
 export const CODE = {
@@ -87,6 +89,62 @@ export function transportCause(error) {
   return parts.length > 0 ? ` — ${parts.join('; ')}` : ''
 }
 
+/**
+ * Whether a failed send never got a response at all because the peer dropped the
+ * connection while the request was still being processed.
+ *
+ * The free lane's gateway parks a queued request and, on its own schedule,
+ * closes it without a status line — measured at ~65 s, twice at the same wall
+ * time. That is distinguishable from a genuine refusal (the peer answers with a
+ * status) and from our own deadline (the signal is aborted, handled earlier), so
+ * it is the one transport failure worth replaying.
+ */
+function isHeadReset(error) {
+  for (let node = error, depth = 0; depth < 4 && node !== null && node !== undefined; depth += 1) {
+    const code = typeof node === 'object' ? node.code : undefined
+    if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET') return true
+    node = typeof node === 'object' ? node.cause : undefined
+  }
+  return false
+}
+
+/**
+ * A classified refusal whose words are ours, not the gateway's.
+ *
+ * `rawMessage` is the gateway's sentence, kept for the log only: every branch
+ * below used to hand that sentence straight to the caller, which is how a 429
+ * reached clients as an upsell for the upstream's paid plan. The public text
+ * comes from the class and the status (see `publicMessageFor`), so a new
+ * upstream wording can never become a new leak.
+ */
+function refusal(code, status, rawMessage, details = {}) {
+  const error = new UpstreamError(publicMessageFor({ code, status }), code, { status, ...details, rawMessage })
+  // The caller will never read `rawMessage`; this is the only place it goes.
+  logUpstreamFailure(error)
+  return error
+}
+
+/**
+ * The front proxy's page gets the one upstream refusal we still explain.
+ *
+ * The sentence is ours ("usually a WAF or body-size limit in front of the
+ * gateway, not your credentials"), it names a hop and a fix, and there is no
+ * supplier in it — so it is allowed across the boundary as written. The status
+ * still picks the class, because a WAF's 403 must not read as a bad credential.
+ */
+function htmlPageFailure(status, type, message) {
+  const client = status >= 400 && status < 500 && status !== 408 && status !== 425
+  const error = new UpstreamError(message, client ? CODE.client : CODE.server, { status, type, rawMessage: message })
+  logUpstreamFailure(error)
+  return error
+}
+
+/** Log an error built outside `refusal` and hand it back, so `throw` stays one line. */
+function logAndReturn(error) {
+  logUpstreamFailure(error)
+  return error
+}
+
 /** Turn a gateway JSON error envelope into a classified failure. */
 export function classifyFailure(status, payload, retryAfterMs) {
   const error = payload?.error ?? payload ?? {}
@@ -100,18 +158,24 @@ export function classifyFailure(status, payload, retryAfterMs) {
   // (errorPageMessage); both name the hop instead of the credential (issue #63).
   const rawHtml = /^\s*<(!doctype|html[\s>])/i.test(raw)
   const isHtmlPage = rawHtml || raw.includes('with an HTML error page')
+  // The one authored explanation: it names a hop and a fix, no vendor. It is
+  // still written by us, so it is allowed across the boundary as it stands.
   const message = rawHtml
     ? `the gateway's front proxy answered HTTP ${status} with an HTML error page — usually a WAF or body-size limit in front of the gateway, not your credentials; if this hit a long conversation, its request size is the likely trigger`
     : raw
-  const flat = message.toLowerCase()
+  if (isHtmlPage) return htmlPageFailure(status, type, message)
+  // Classification reads the gateway's own sentence, never the public one: the
+  // public text is a fixed phrase per class, so matching on it would make every
+  // branch below unreachable. Only the *output* is blurred, not the reading.
+  const flat = raw.toLowerCase()
   if (type === 'RegionError' || /not available in your country|region/i.test(flat)) {
-    return new UpstreamError(message, CODE.region, { status, type })
+    return refusal(CODE.region, status, message, { type })
   }
   if (type !== 'permission_error' && (type === 'insufficient_quota' || error.code === 'insufficient_quota')) {
-    return new UpstreamError(message, CODE.exhausted, { status, type })
+    return refusal(CODE.exhausted, status, message, { type })
   }
   if (type !== 'permission_error' && (status === 429 || type === 'FreeUsageLimitError' || /usage limit|rate limit/i.test(flat))) {
-    return new UpstreamError(message, CODE.quota, { status, type, providerRetryAfterMs: retryAfterMs })
+    return refusal(CODE.quota, status, message, { type, providerRetryAfterMs: retryAfterMs })
   }
   // The gateway rejects a signature only when the bytes it received differ from
   // the bytes that were signed — the credential itself is fine. On this lane
@@ -122,7 +186,7 @@ export function classifyFailure(status, payload, retryAfterMs) {
   if ((status === 401 || status === 403) && /signature rejected|signature mismatch/i.test(flat)) {
     return new UpstreamError(
       'the gateway rejected the request signature — the request body was modified in transit; if a local proxy plugin (e.g. billion-context) is installed, disable it for this lane or enable its passthrough for signed requests',
-      CODE.transport, { status, type, signatureRejected: true })
+      CODE.transport, { status, type, signatureRejected: true, rawMessage: message })
   }
   // The co-paid lane's per-user gate speaks before any credential is judged:
   // the gateway refuses a turn because this install has not completed GitHub
@@ -131,7 +195,7 @@ export function classifyFailure(status, payload, retryAfterMs) {
   // and send users chasing a re-install; it is a user-actionable state, so it
   // gets its own code and the settings page answers with a login prompt.
   if (type === 'AuthorizationRequired' || /需要 GitHub 授权|GitHub 授权无效/.test(raw)) {
-    return new UpstreamError(message, CODE.authorization, { status, type, reason: typeof error.reason === 'string' ? error.reason : '' })
+    return refusal(CODE.authorization, status, message, { type, reason: typeof error.reason === 'string' ? error.reason : '' })
   }
   // The free lane's client gate (issue #310): 403 FreeTierError — "OpenCode's
   // free tier can only be used from within OpenCode" — names the client, not
@@ -143,15 +207,15 @@ export function classifyFailure(status, payload, retryAfterMs) {
   // probe reads it as a lane-level lock (src/probe.js) instead of leaving the
   // model in the picker as "unknown".
   if (type === 'FreeTierError' || /free tier can only be used from within/i.test(flat)) {
-    return new UpstreamError(message, CODE.laneLocked, { status, type })
+    return refusal(CODE.laneLocked, status, message, { type })
   }
-  if (type === 'permission_error') return new UpstreamError(message, CODE.permission, { status, type })
+  if (type === 'permission_error') return refusal(CODE.permission, status, message, { type })
   // An HTML page at 401/403 is the front proxy speaking, not the credential
   // store: fall through to the 4xx branch so users are not sent re-logging for
   // a WAF refusal.
-  if (status === 401 || status === 403) return new UpstreamError(message, isHtmlPage ? CODE.client : CODE.credential, { status, type })
+  if (status === 401 || status === 403) return refusal(CODE.credential, status, message, { type })
   if (type === 'ModelError' || /model is unavailable|not supported/.test(flat)) {
-    return new UpstreamError(message, CODE.server, { status, type, unavailable: true })
+    return refusal(CODE.server, status, message, { type, unavailable: true })
   }
   // 4xx is the request's own fault: replaying the identical body reproduces the
   // identical refusal, so it stays outside the harness's retryable set — which
@@ -160,9 +224,9 @@ export function classifyFailure(status, payload, retryAfterMs) {
   // can answer differently. Out-of-band callers pass no status at all, so they
   // keep falling through to SERVER below.
   if (status >= 400 && status < 500 && status !== 408 && status !== 425) {
-    return new UpstreamError(message, CODE.client, { status, type })
+    return refusal(CODE.client, status, message, { type })
   }
-  return new UpstreamError(message, CODE.server, { status, type })
+  return refusal(CODE.server, status, message, { type })
 }
 
 /** Parse `Retry-After` into milliseconds, when the header carries a number. */
@@ -260,7 +324,10 @@ export async function readHead(stream, limit, { signal, timeoutMs }) {
 export function classifyStreamFailure(error, signal) {
   if (error instanceof UpstreamError) return error
   if (signal?.aborted === true || error?.name === 'AbortError') return new UpstreamError('request aborted', CODE.aborted)
-  return new UpstreamError(`our-free-model: upstream stream read failed: ${error?.message ?? error}${transportCause(error)}`, CODE.transport)
+  // The detail — including whatever hostname the socket error names — goes to
+  // the log; the caller learns only that the connection failed.
+  const detail = `upstream stream read failed: ${error?.message ?? error}${transportCause(error)}`
+  return logAndReturn(new UpstreamError(publicMessageFor({ code: CODE.transport }), CODE.transport, { rawMessage: detail }))
 }
 
 /** The head is the one read with no line-level deadline behind it, so it needs its own. */
@@ -280,7 +347,7 @@ async function headRead(reader, signal, deadline) {
   let onAbort
   const pending = reader.read()
   const halted = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new UpstreamError('our-free-model: upstream sent no bytes before its deadline', CODE.timeout)),
+    timer = setTimeout(() => reject(new UpstreamError('upstream sent no bytes before its deadline', CODE.timeout)),
       Math.max(0, deadline - Date.now()))
     timer.unref?.()
     onAbort = () => {
@@ -418,18 +485,91 @@ function emptyBodyFailure(status, retryAfterMs, imageContent) {
     { status, emptyBody: true, ...(retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs }) })
 }
 
-export async function postStreamed({ path, body, session, attributionUserAgent, signal, onData, timeoutMs = 300000 }) {
+/**
+ * One upstream turn, moved to the next outlet when the gateway says 429.
+ *
+ * The free lane's quota is per exit address, so a spent 429 is not a verdict on
+ * the request — the same body from a different address is a different question.
+ * `egressPlan` decides the rungs (see src/egress.js): with an outlet running in
+ * `failover` policy that is direct first, outlet second. Everything else about
+ * the turn — the single replay on a reset connection, the session id, the
+ * non-retryable 4xx — stays inside one rung, because those are properties of
+ * the request, not of the route.
+ */
+export async function postStreamed(options) {
+  const routes = outletRoutePlan()
+  let lastError
+  for (let index = 0; index < routes.length; index += 1) {
+    const route = routes[index]
+    // Every rung after the first is a different exit, so it also gets a
+    // different session id: a spent session is not carried onto a fresh
+    // address. The first rung keeps the conversation's own id, so a healthy turn
+    // still hits its upstream cache.
+    const session = index === 0 ? options.session : mintSessionId()
+    // Only interesting when the pool reordered itself: on a healthy machine the
+    // first rung is direct and this stays silent. `always` starts on a node by
+    // definition, so it stays silent there too.
+    if (index === 0 && route.kind !== 'direct' && egressPolicy() === 'failover') {
+      logFailureNote(`starting on ${route.kind === 'node' ? `"${route.node}"` : 'the outlet'} (the direct route is cooling)`)
+    }
+    // A node rung has to be pinned before the request goes out; if the
+    // controller refuses, the turn still tries the outlet rather than failing.
+    const pinned = route.kind === 'node' ? await applyOutletNode(route.node) : false
+    const outlet = route.kind === 'direct' ? 'direct' : 'relay'
+    try {
+      const result = await postStreamedOnce({ ...options, session, outlet })
+      if (pinned) markOutletSuccess(route.node)
+      return result
+    } catch (error) {
+      lastError = error
+      // 429 is a verdict on the exit address — direct included, which is why it
+      // has an entry of its own in the book.
+      if (error?.status === 429) {
+        if (route.kind === 'direct') markOutlet429(DIRECT_ROUTE)
+        else if (pinned) markOutlet429(route.node)
+      }
+      const next = routes[index + 1]
+      if (error?.status !== 429 || next === undefined) throw error
+      // The refused attempt spent nothing (nothing was generated), so this is
+      // the one retry that is free. The raw sentence is already in the log;
+      // this line records which route refused and where the turn goes next.
+      const from = route.kind === 'direct' ? 'the direct route' : `"${route.node}"`
+      const to = next.kind === 'direct' ? 'the direct route' : next.kind === 'relay' ? 'the outlet' : `"${next.node}"`
+      logFailureNote(`${error.code} from ${from}; retrying over ${to} with a fresh session`)
+    }
+  }
+  if (lastError !== undefined) throw lastError
+  // Every rung was skipped: no outlet to pin, no direct attempt made.
+  throw new UpstreamError(publicMessageFor({ code: CODE.transport }), CODE.transport, { rawMessage: 'no outlet route could be established' })
+}
+
+async function postStreamedOnce({ path, body, session, attributionUserAgent, signal, onData, timeoutMs = 300000, outlet }) {
   const headers = gatewayHeaders({ session: truncateSession(session), stream: true })
   headers['user-agent'] = userAgentWith(attributionUserAgent)
+  const requestBody = JSON.stringify(body)
+  const send = () => egressFetch(`${UPSTREAM_BASE}${path}`, { method: 'POST', headers, body: requestBody, redirect: 'error', signal }, { outlet })
   let response
   try {
-    response = await egressFetch(`${UPSTREAM_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), redirect: 'error', signal })
+    response = await send()
   } catch (error) {
     // The signal's own reason is what fetch rejects with, and Node's is a
     // `TimeoutError`/user Error rather than `AbortError` — testing the name alone
     // reported a cancelled turn as `TRANSPORT`, which is retryable.
     if (signal?.aborted === true || error?.name === 'AbortError') throw new UpstreamError('request aborted', CODE.aborted)
-    throw new UpstreamError(`our-free-model: upstream request failed: ${error?.message ?? error}${transportCause(error)}`, CODE.transport)
+    // The gateway sometimes drops a queued connection without a single byte of
+    // answer — measured at ~65 s, the same wait twice, well before this client's
+    // own deadline. Nothing has been sent downstream at this point and the
+    // request is replayable, so one immediate retry turns a dead turn into a
+    // served one. A second reset is reported as it happened.
+    let retried = error
+    if (isHeadReset(error)) {
+      try { response = await send() } catch (again) { retried = again }
+    }
+    if (response === undefined) {
+      const cause = isHeadReset(retried) ? ' (the gateway reset the connection before answering)' : transportCause(retried)
+      throw logAndReturn(new UpstreamError(publicMessageFor({ code: CODE.transport }), CODE.transport,
+        { rawMessage: `upstream request failed: ${retried?.message ?? retried}${cause}` }))
+    }
   }
 
   const setRetry = retryAfter(response.headers.get('retry-after'))
@@ -444,14 +584,14 @@ export async function postStreamed({ path, body, session, attributionUserAgent, 
     try { payload = JSON.parse(text) } catch { payload = { error: { message: text.slice(0, 300) || `HTTP ${response.status}` } } }
     throw classifyFailure(response.status, payload, setRetry)
   }
-  if (response.body === null) throw new UpstreamError('our-free-model: upstream returned no body', CODE.empty)
+  if (response.body === null) throw new UpstreamError('upstream returned no body', CODE.empty)
 
   // `Content-Type` is a hint, not a verdict: take the first bytes and let the body
   // say what it is. Whatever was spent reading them is replayed in front of the
   // stream, so nothing is buffered away and no frame is dropped.
   const head = await readHead(response.body, SNIFF_BYTES, { signal, timeoutMs })
   const shape = sniffBody(head.text)
-  if (shape === 'empty') throw new UpstreamError('our-free-model: upstream returned no body', CODE.empty)
+  if (shape === 'empty') throw new UpstreamError('upstream returned no body', CODE.empty)
   if (shape === 'sse') {
     await readSse(replayStream(head), onData, signal, timeoutMs)
     return { status: response.status, headers: response.headers }
@@ -465,11 +605,11 @@ export async function postStreamed({ path, body, session, attributionUserAgent, 
     if (/^\s*<(!doctype|html[\s>])/i.test(text)) {
       throw new UpstreamError(`the gateway's front proxy answered HTTP ${response.status} with an HTML error page — usually a WAF or body-size limit in front of the gateway`, CODE.client, { status: response.status })
     }
-    throw new UpstreamError(`our-free-model: unexpected non-SSE response: ${text.slice(0, 200)}`, CODE.server, { status: response.status })
+    throw refusal(CODE.server, response.status, `unexpected non-SSE response: ${text.slice(0, 200)}`)
   }
   let payload
   try { payload = JSON.parse(text) } catch {
-    throw new UpstreamError(`our-free-model: unexpected non-SSE response: ${text.slice(0, 200)}`, CODE.server, { status: response.status })
+    throw refusal(CODE.server, response.status, `unexpected non-SSE response: ${text.slice(0, 200)}`)
   }
   if (payload.error) throw classifyFailure(response.status, payload, setRetry)
   onData(JSON.stringify(payload))
@@ -525,7 +665,7 @@ export async function readSse(source, onData, signal, timeoutMs = 300000) {
       signal?.addEventListener('abort', onAbort, { once: true })
       timer = setTimeout(() => {
         stop()
-        reject(new UpstreamError('our-free-model: upstream stream idle past its deadline', CODE.timeout))
+        reject(new UpstreamError('upstream stream idle past its deadline', CODE.timeout))
       }, Math.max(0, deadline - Date.now()))
     })
     const pending = Promise.resolve().then(() => reader !== null ? reader.read() : iterator.next())
@@ -585,7 +725,7 @@ export async function readSse(source, onData, signal, timeoutMs = 300000) {
     while (true) {
       const { value, done } = await next()
       if (done) break
-      if (Date.now() > deadline) throw new UpstreamError('our-free-model: upstream stream idle past its deadline', CODE.timeout)
+      if (Date.now() > deadline) throw new UpstreamError('upstream stream idle past its deadline', CODE.timeout)
       if (value !== undefined) buffer += decoder.decode(value, { stream: true })
       let newline = buffer.indexOf('\n')
       while (newline !== -1) {
@@ -643,8 +783,9 @@ export async function getJson(path, { session, attributionUserAgent, signal, tim
   } catch (error) {
     if (error instanceof UpstreamError) throw error
     if (callerAborted || signal?.aborted === true) throw new UpstreamError('request aborted', CODE.aborted)
-    if (error?.name === 'AbortError') throw new UpstreamError('our-free-model: upstream GET timed out', CODE.timeout)
-    throw new UpstreamError(`our-free-model: upstream GET failed: ${error?.message ?? error}${transportCause(error)}`, CODE.transport)
+    if (error?.name === 'AbortError') throw new UpstreamError('upstream GET timed out', CODE.timeout)
+    throw logAndReturn(new UpstreamError(publicMessageFor({ code: CODE.transport }), CODE.transport,
+      { rawMessage: `upstream GET failed: ${error?.message ?? error}${transportCause(error)}` }))
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener?.('abort', onCallerAbort)

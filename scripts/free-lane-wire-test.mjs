@@ -228,7 +228,12 @@ console.log('\n=== 7. an empty 5xx body names the hop instead of saying "HTTP 50
   // failure — it must reach the caller unchanged.
   scriptedReply = { status: 502, body: '{"error":{"message":"upstream connect timeout"}}' }
   const enveloped = await failureOf({ messages: [{ role: 'user', content: 'ping' }] })
-  check('a 502 with an envelope keeps its own message', enveloped?.message, 'upstream connect timeout')
+  // The envelope's sentence is upstream prose: the caller gets the class, the
+  // log keeps the words (see `logUpstreamFailure`).
+  check('a 502 with an envelope reports the class, not the prose',
+    enveloped?.message, '502 the upstream gateway failed')
+  check('…while the raw sentence stays available for the log',
+    enveloped?.rawMessage, 'upstream connect timeout')
   check('…and is not marked as an empty body', enveloped?.emptyBody, undefined)
 
   // The 4xx path is deliberately untouched: an empty 401 is still a credential

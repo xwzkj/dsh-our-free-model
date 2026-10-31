@@ -37,7 +37,7 @@ import { performance } from 'node:perf_hooks'
 import { baseModelId, FINGERPRINT_TOOLS } from './upstream.js'
 import { anthropicFrames, anthropicMessage, countTokens, foldAnthropicOutcome, fromAnthropicRequest } from './anthropic.js'
 import { toMessagesResponse, tryOptimizations } from './local-optimize.js'
-import { carryFailure, forwardFailure } from './failure.js'
+import { carryFailure, forwardFailure, sanitizeErrorMessage } from './failure.js'
 import { deferStreamResponse } from './deferred-response.js'
 import { geminiEndpoint, geminiError, geminiRoute } from './gemini.js'
 import { createSessionAffinity } from './session-affinity.js'
@@ -154,7 +154,7 @@ function json(res, status, payload) {
 }
 
 function openAiError(res, status, type, message, code = null) {
-  json(res, status, { error: { message, type, param: null, code } })
+  json(res, status, { error: { message: sanitizeErrorMessage(message), type, param: null, code } })
 }
 
 /** Send classified early failures before committing an SSE success status. */
@@ -358,7 +358,7 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
     const settings = config()
     if (!settings.enabled) {
       if (gemini) { geminiError(res, 503, 'the forward listener is switched off'); return }
-      openAiError(res, 503, 'service_unavailable', 'the forward listener is switched off in Our Free Model settings')
+      openAiError(res, 503, 'service_unavailable', 'the forward listener is switched off in the service settings')
       return
     }
     // CORS preflight, so a browser-based harness on another origin can use it.
@@ -391,15 +391,15 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
       return
     }
     if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/chat/completions')) {
-      await serveCompletion(req, res, complete, chatCompletions, heartbeatMs, trace, { optimize, affinity })
+      await serveCompletion(req, res, complete, chatCompletions, heartbeatMs, trace, { optimize, affinity, modelRows })
       return
     }
     if (req.method === 'POST' && (path === '/v1/responses' || path === '/responses')) {
-      await serveCompletion(req, res, complete, responsesEndpoint, heartbeatMs, trace, { optimize, affinity })
+      await serveCompletion(req, res, complete, responsesEndpoint, heartbeatMs, trace, { optimize, affinity, modelRows })
       return
     }
     if (req.method === 'POST' && (path === '/v1/messages' || path === '/messages')) {
-      await serveCompletion(req, res, complete, messagesEndpoint, heartbeatMs, trace, { optimize, affinity })
+      await serveCompletion(req, res, complete, messagesEndpoint, heartbeatMs, trace, { optimize, affinity, modelRows })
       return
     }
     if (req.method === 'POST' && (path === '/v1/messages/count_tokens' || path === '/messages/count_tokens')) {
@@ -555,7 +555,7 @@ export async function startLanRelay({ config, log = () => {}, onTrace = () => {}
     }
     const settings = config()
     if (!settings.enabled) {
-      openAiError(res, 503, 'service_unavailable', 'the LAN relay is switched off in Our Free Model settings')
+      openAiError(res, 503, 'service_unavailable', 'the LAN relay is switched off in the service settings')
       return
     }
     if (!authorized(req, settings.lanKey)) {
@@ -832,15 +832,50 @@ function callerEffort(body) {
   return /\(([^()]+)\)\s*$/.exec(String(body.model ?? ''))?.[1].trim() || undefined
 }
 
+/**
+ * Paid-looking name → the free lane's `-free` sibling.
+ *
+ * A caller may ask for `deepseek-v4.1-flash` although this gateway only routes
+ * `deepseek-v4.1-flash-free`; the request goes to the sibling and the answer is
+ * labelled with the name the caller used. A real id always wins, a request that
+ * already carries the suffix is passed through untouched, and no alias is made
+ * when the sibling is not actually routable.
+ *
+ * @returns {{model: string, response: string}} upstream id and response label.
+ */
+function resolveForwardModel(model, modelRows) {
+  const requested = String(model ?? '').trim()
+  if (requested === '' || typeof modelRows !== 'function') return { model: requested, response: requested }
+  if (requested.endsWith('-free')) return { model: requested, response: requested }
+  let known
+  try {
+    // The roster also advertises each aliased name (so clients can pick it), and
+    // that row carries `x_ofm_alias`. A listed alias is a pointer, not a model:
+    // counting it as a real id would stop the request from resolving to its
+    // `-free` sibling and dispatch the alias itself, which routes nowhere.
+    known = new Set((modelRows() ?? [])
+      .filter(row => row?.x_ofm_alias === undefined)
+      .map(row => row?.id)
+      .filter(id => typeof id === 'string' && id !== ''))
+  } catch { return { model: requested, response: requested } }
+  if (known.has(requested)) return { model: requested, response: requested }
+  const sibling = `${requested}-free`
+  return known.has(sibling) ? { model: sibling, response: requested } : { model: requested, response: requested }
+}
+
 /** Drive one chat-completion through `complete`, in either response style. */
 async function chatCompletions(req, res, complete, options = {}) {
   const body = await readBody(req)
   options.trace?.step('body_received')
-  const model = baseModelId(String(body.model ?? ''))
-  if (model === '') {
+  const requestedModel = baseModelId(String(body.model ?? ''))
+  if (requestedModel === '') {
     openAiError(res, 400, 'invalid_request_error', '`model` is required')
     return
   }
+  const resolved = resolveForwardModel(requestedModel, options.modelRows)
+  // `model` is what every response frame carries; `resolved.model` is what the
+  // adapter looks up and sends upstream.
+  const model = resolved.response
   const id = `chatcmpl-${crypto.randomBytes(8).toString('hex')}`
   const created = Math.floor(Date.now() / 1000)
   const wantsStream = body.stream === true
@@ -852,7 +887,7 @@ async function chatCompletions(req, res, complete, options = {}) {
   const sessionKey = () => options.affinity?.resolve(req, body, { apiKey: bearerOf(req) })
 
   if (!wantsStream) {
-    const outcome = await complete({ model, openAi: body, sessionKey })
+    const outcome = await complete({ model: resolved.model, openAi: body, sessionKey })
     // 截断或恢复失败即使已有部分正文，也不能返回正常完成。
     if (outcome.error !== undefined) {
       failureReply(res, outcome, false, true)
@@ -884,7 +919,7 @@ async function chatCompletions(req, res, complete, options = {}) {
   sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })
   let outcome
   try {
-    outcome = await complete({ model, openAi: body, sessionKey }, (chunk) => {
+    outcome = await complete({ model: resolved.model, openAi: body, sessionKey }, (chunk) => {
       if (res.destroyed) return
       if (chunk.type === 'text-delta') {
         sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }] })
@@ -939,7 +974,7 @@ async function chatCompletions(req, res, complete, options = {}) {
     // here is the empty-200 this endpoint's non-streaming branch already fixed.
     options.trace?.setOutcome('failed')
     if (!res.destroyed) {
-      sendSse(res, { error: { message: String(error?.message ?? error), type: 'server_error' } })
+      sendSse(res, { error: { message: sanitizeErrorMessage(error?.message ?? error), type: 'server_error' } })
       res.write('data: [DONE]\n\n')
       res.end()
     }
@@ -966,7 +1001,7 @@ async function chatCompletions(req, res, complete, options = {}) {
   if (suppressed !== null) {
     // Same reasoning as the `outcome.error` branch above: the status line is
     // spent, so the only honest place left for the explanation is the stream.
-    sendSse(res, { error: { message: suppressed, type: 'server_error' } })
+    sendSse(res, { error: { message: sanitizeErrorMessage(suppressed), type: 'server_error' } })
     res.write('data: [DONE]\n\n')
     res.end()
     return
@@ -1031,11 +1066,13 @@ function suppressedOnlyNote(outcome, calls) {
 async function responsesEndpoint(req, res, complete, options = {}) {
   const body = await readBody(req)
   options.trace?.step('body_received')
-  const model = baseModelId(String(body.model ?? ''))
-  if (model === '') {
+  const requestedModel = baseModelId(String(body.model ?? ''))
+  if (requestedModel === '') {
     openAiError(res, 400, 'invalid_request_error', '`model` is required')
     return
   }
+  const resolved = resolveForwardModel(requestedModel, options.modelRows)
+  const model = resolved.response
   const id = `resp-${crypto.randomBytes(8).toString('hex')}`
   const created = Math.floor(Date.now() / 1000)
   // `instructions` is the Responses spelling of a system prompt and
@@ -1051,6 +1088,9 @@ async function responsesEndpoint(req, res, complete, options = {}) {
   const effort = callerEffort(body)
   const openAi = {
     ...body,
+    // The adapter reads `request.model`; keep the body's own copy in step so a
+    // later consumer of openAi never sees the alias.
+    model: resolved.model,
     input,
     ...(typeof body.max_output_tokens === 'number' ? { max_tokens: body.max_output_tokens } : {}),
     ...effort === undefined ? {} : { reasoning_effort: effort },
@@ -1110,7 +1150,7 @@ async function responsesEndpoint(req, res, complete, options = {}) {
     let usage
     let outcome
     try {
-      outcome = await complete({ model, openAi, sessionKey, responses: true, responsesBody: body }, (chunk) => {
+      outcome = await complete({ model: resolved.model, openAi, sessionKey, responses: true, responsesBody: body }, (chunk) => {
         if (res.destroyed) return
         if (chunk.type === 'text-delta') {
           announceMessage()
@@ -1133,7 +1173,7 @@ async function responsesEndpoint(req, res, complete, options = {}) {
       // event the protocol defines instead of ending a 200 after one frame.
       options.trace?.setOutcome('failed')
       if (!res.destroyed) {
-        say('response.failed', { response: response({ status: 'failed', error: { message: String(error?.message ?? error) } }) })
+        say('response.failed', { response: response({ status: 'failed', error: { message: sanitizeErrorMessage(error?.message ?? error) } }) })
         res.end()
       }
       return
@@ -1146,7 +1186,7 @@ async function responsesEndpoint(req, res, complete, options = {}) {
     }
     const suppressedStream = suppressedOnlyNote(outcome, executableCalls(outcome, tools))
     if (suppressedStream !== null) {
-      say('response.failed', { response: response({ status: 'failed', error: { message: suppressedStream } }) })
+      say('response.failed', { response: response({ status: 'failed', error: { message: sanitizeErrorMessage(suppressedStream) } }) })
       res.end()
       return
     }
@@ -1205,7 +1245,7 @@ async function responsesEndpoint(req, res, complete, options = {}) {
     return
   }
 
-  const outcome = await complete({ model, openAi, sessionKey, responses: true, responsesBody: body })
+  const outcome = await complete({ model: resolved.model, openAi, sessionKey, responses: true, responsesBody: body })
   if (outcome.error !== undefined) {
     failureReply(res, outcome, false, true)
     return
@@ -1257,7 +1297,9 @@ async function messagesEndpoint(req, res, complete, options = {}) {
     anthropicError(res, 400, 'invalid_request_error', parsed.error)
     return
   }
-  const model = baseModelId(parsed.model)
+  const requestedModel = baseModelId(parsed.model)
+  const resolved = resolveForwardModel(requestedModel, options.modelRows)
+  const model = resolved.response
   const wantsStream = parsed.stream === true
   const id = `msg_${crypto.randomBytes(12).toString('hex')}`
 
@@ -1297,7 +1339,7 @@ async function messagesEndpoint(req, res, complete, options = {}) {
     ? parsed.messages
     : [{ role: 'system', content: [{ type: 'text', text: parsed.system }] }, ...parsed.messages]
   const request = {
-    model,
+    model: resolved.model,
     messages,
     tools: parsed.tools,
     sessionKey: () => options.affinity?.resolve(req, body, { apiKey: bearerOf(req) }),
@@ -1388,7 +1430,7 @@ function newMessageState(messageId, model) {
 
 /** Anthropic's error envelope, which is `{type:'error', error:{type, message}}`. */
 function anthropicError(res, status, type, message) {
-  const body = JSON.stringify({ type: 'error', error: { type, message: String(message) } })
+  const body = JSON.stringify({ type: 'error', error: { type, message: sanitizeErrorMessage(message) } })
   res.writeHead(status, { ...corsHeaders(), 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(body)
 }

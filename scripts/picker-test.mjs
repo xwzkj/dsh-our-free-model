@@ -199,7 +199,12 @@ for await (const chunk of adapter.stream({
 })) hiddenTurn.push(chunk)
 const hiddenFinish = hiddenTurn.find(chunk => chunk.type === 'finish')?.reason
 check('a turn on it fails as an upstream error, not as an unresolvable model', hiddenFinish?.kind, 'error')
-check('with the gateway message attached', /unavailable/i.test(hiddenFinish?.failure?.message ?? ''), true)
+// The failure names the class, not the gateway's sentence: a hidden model's
+// turn still fails as "the upstream gateway failed", which is what the user
+// needs to see. The raw text goes to the log.
+check('with the classified failure attached',
+  hiddenFinish?.failure?.message, '400 the upstream gateway failed')
+check('…and no upstream prose on the wire', /unavailable/i.test(hiddenFinish?.failure?.message ?? ''), false)
 
 // Turning the region group off hides those models rather than listing them as broken.
 await callRoute(api(), 'POST', '/api/our-free-model/settings', { exposeRegionModels: false })

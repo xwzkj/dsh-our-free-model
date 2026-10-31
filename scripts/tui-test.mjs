@@ -133,7 +133,8 @@ const forward = await fetch(`http://127.0.0.1:${forwardPort}/v1/models`, { heade
 check('the forward listener came up without a web server', forward.status, 401)
 const key = JSON.parse(fs.readFileSync(path.join(scratch, 'our-free-model', 'settings.json'), 'utf8')).forwardKey
 const rows = await (await fetch(`http://127.0.0.1:${forwardPort}/v1/models`, { headers: { authorization: `Bearer ${key}` } })).json()
-check('and lists the usable models with the real key', rows.data.map(row => row.id).sort(), ['mimo-v2.6-flash-free', 'space-bunny-free'])
+check('and lists the usable models with the real key', rows.data.map(row => row.id).sort(),
+  ['mimo-v2.6-flash', 'mimo-v2.6-flash-free', 'space-bunny', 'space-bunny-free'])
 const answered = await (await fetch(`http://127.0.0.1:${forwardPort}/v1/chat/completions`, {
   method: 'POST',
   headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
@@ -194,7 +195,8 @@ const lanKey = written.forwardLanKey
 check('with a key of its own, minted apart from the local one', typeof lanKey === 'string' && lanKey !== '' && lanKey !== key, true)
 const lanModels = await fetch(`http://127.0.0.1:${lanPort}/v1/models`, { headers: { authorization: `Bearer ${lanKey}` } })
 check('the network key reaches the model list', lanModels.status, 200)
-check('…with the roster the local listener serves', (await lanModels.json()).data.map(row => row.id).sort(), ['mimo-v2.6-flash-free', 'space-bunny-free'])
+check('…with the roster the local listener serves', (await lanModels.json()).data.map(row => row.id).sort(),
+  ['mimo-v2.6-flash', 'mimo-v2.6-flash-free', 'space-bunny', 'space-bunny-free'])
 check('the local key is not accepted on the network door',
   (await fetch(`http://127.0.0.1:${lanPort}/v1/models`, { headers: { authorization: `Bearer ${key}` } })).status, 401)
 check('and a keyless liveness probe answers nothing on a routable address',
@@ -224,7 +226,11 @@ const refusedBody = await refused.json()
 check('a refused forward call preserves the upstream request status', refused.status, 400)
 check('and preserves its classified code and response type',
   [refusedBody.error?.code, refusedBody.error?.type], ['SERVER', 'invalid_request_error'])
-check('and says what the gateway said', /unavailable/i.test(refusedBody.error?.message ?? ''), true)
+// Blurred on purpose (see `publicMessageFor`): the caller reads the class and
+// the status, never the gateway's own sentence.
+check('and reports the failure without echoing the gateway',
+  [refusedBody.error?.message, /unavailable/i.test(refusedBody.error?.message ?? '')],
+  ['400 the upstream gateway failed', false])
 stub.api.refuseAll = false
 
 // The same refusal on the streaming side, where the status line was already spent

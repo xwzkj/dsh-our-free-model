@@ -203,7 +203,7 @@ function checkBlocks(chunks) {
   assert.equal(ended.size, starts.length, '每个已开启的块必须结束')
 }
 
-function checkFinal(run, kind, requests) {
+function checkFinal(run, kind, requests, attempts = requests) {
   assert.equal(run.scenario.requests.length, requests, '实际 HTTP 请求数')
   assert.equal(run.chunks.filter(chunk => chunk.type === 'finish').length, 1, '只能有一个最终 finish')
   const usageCount = run.chunks.filter(chunk => chunk.type === 'usage').length
@@ -212,13 +212,16 @@ function checkFinal(run, kind, requests) {
   assert.equal(run.finish?.kind, kind)
   assert.equal(run.turns.length, 1, '一次适配器调用只能记一条逻辑回合')
   assert.equal(run.turns[0].ok, kind === 'stop', '逻辑回合结果必须跟最终结果一致')
-  assert.equal(run.turns[0].attempts, requests, '逻辑回合保留实际物理请求数')
+  // `attempts` is counted by the adapter, one per adapter call: a replay inside
+  // the transport (same POST, same turn) raises the physical count without
+  // raising this one, which is exactly the difference being asserted.
+  assert.equal(run.turns[0].attempts, attempts, '逻辑回合保留实际物理请求数')
   assert.equal(run.turns[0].recovered, kind === 'stop' && requests === 2, '只有成功续写才标为 recovered')
   checkBlocks(run.chunks)
 }
 
-function checkCut(run, requests = 2) {
-  checkFinal(run, 'error', requests)
+function checkCut(run, requests = 2, attempts = requests) {
+  checkFinal(run, 'error', requests, attempts)
   assert.equal(run.finish?.failure?.code, 'STREAM_CUT')
   assert.equal(run.adapter.providerRetryPolicy().retryableCodes.includes(run.finish.failure.code), false, '恢复失败不能触发宿主整轮重发')
 }
@@ -549,16 +552,19 @@ try {
 
   const model = REPRESENTATIVES[0]
   const wire = wireFor(model)
-  for (const [label, answer] of [
-    ['HTTP 429', { status: 429, body: '{"error":{"message":"rate limit"}}' }],
-    ['HTTP 503', { status: 503, body: '{"error":{"message":"server unavailable"}}' }],
-    ['socket reset', { socket: true }],
-    ['空响应', { body: '' }],
-    ['流内错误', { body: sse({ type: 'error', error: { type: 'RegionError', message: 'This model is not available in your country.' } }) }],
+  for (const [label, answer, requests] of [
+    ['HTTP 429', { status: 429, body: '{"error":{"message":"rate limit"}}' }, 2],
+    ['HTTP 503', { status: 503, body: '{"error":{"message":"server unavailable"}}' }, 2],
+    // A reset *before any header* is replayed once by the transport itself
+    // (src/http.js `isHeadReset`) — that is the same POST, not a fresh turn, so
+    // the failed segment costs 3 requests: segment one, the reset, its replay.
+    ['socket reset', { socket: true }, 3],
+    ['空响应', { body: '' }, 2],
+    ['流内错误', { body: sse({ type: 'error', error: { type: 'RegionError', message: 'This model is not available in your country.' } }) }, 2],
   ]) {
     await check(`恢复失败 ${label} 不触发整轮重发`, async () => {
       const run = await drive(model, [{ body: deltas(wire, { reasoning: CHECKPOINT }) }, answer])
-      checkCut(run)
+      checkCut(run, requests, 2)
     })
   }
 
@@ -674,7 +680,7 @@ try {
     checkFinal(run, 'error', 1)
     assert.equal(run.adapter.providerRetryPolicy().retryableCodes.includes(run.finish?.failure?.code), false)
     assert.ok(run.elapsedMs < 1000)
-    assert.match(run.finish.failure.message, /^our free model reached its 0s time limit before its finish token$/)
+    assert.match(run.finish.failure.message, /^the model reached its 0s time limit before its finish token$/)
   })
 
   await check('恢复回合的丢弃内容告警不按 payload 重建次数累积', async () => {

@@ -442,7 +442,10 @@ await checkAsync('a 401 is a credential failure and never carries the key', asyn
   assert.ok(failure instanceof UpstreamError, 'an UpstreamError, not a bare Error')
   assert.equal(failure.code, 'INVALID_CREDENTIAL')
   assert.equal(failure.status, 401)
-  assert.ok(failure.message.includes('[redacted]'), `the echo should be redacted, got: ${failure.message}`)
+  // The wire text is a fixed phrase; the provider's own sentence — with the key
+  // already redacted — is kept for the log.
+  assert.equal(failure.message, '401 authentication failed')
+  assert.ok(failure.rawMessage.includes('[redacted]'), `the echo should be redacted, got: ${failure.rawMessage}`)
   const rendered = `${String(failure)}\n${JSON.stringify(failure)}\n${failure.stack ?? ''}`
   assert.ok(!rendered.includes(CEREBRAS_KEY), `the key leaked into the error: ${rendered}`)
 })
@@ -465,7 +468,9 @@ await checkAsync('a key that JSON escapes is redacted in its escaped spelling to
   assert.equal(failure?.code, 'INVALID_CREDENTIAL')
   const rendered = `${String(failure)}\n${JSON.stringify(failure)}`
   assert.ok(!rendered.includes('weird'), `the key leaked in some spelling: ${rendered}`)
-  assert.ok(failure.message.includes('[redacted]'))
+  assert.equal(failure.message, '401 authentication failed')
+  assert.ok(failure.rawMessage.includes('[redacted]'))
+  assert.ok(!String(failure.rawMessage).includes('weird'), 'the redaction applies to the logged copy too')
 })
 
 await checkAsync('a 429 is a rate-limit failure with the retry hint', async () => {  script = (req, res) => {

@@ -68,7 +68,14 @@ try {
   const listed = await fetch(`http://127.0.0.1:${forwardPort}/v1/models`, {
     headers: { authorization: `Bearer ${stored.forwardKey}` },
   }).catch(() => null)
-  check('and serves a roster to its own key', [listed?.status, (await listed?.json())?.data?.length ?? 0], [200, 1])
+  const roster = (await listed?.json())?.data ?? []
+  check('and serves a roster to its own key', [listed?.status, roster.length], [200, 2])
+  // The roster advertises both the real `-free` id and the stripped alias the
+  // listener routes it to, so a client can ask for either spelling.
+  check('listing both the real id and its stripped alias',
+    roster.map(row => row.id).sort(), ['mimo-v2.6-flash', 'mimo-v2.6-flash-free'])
+  check('the alias row points at the real id',
+    roster.find(row => row.id === 'mimo-v2.6-flash')?.x_ofm_alias, 'mimo-v2.6-flash-free')
 } catch (error) {
   check(`the port answers while the probe round is still in flight (${error?.message ?? error})`, false, true)
 }

@@ -30,7 +30,12 @@ try {
     yield metadata;
     if (response.body) for await (const chunk of response.body) yield chunk;
   })()), process.stdout);
-} catch {
+} catch (error) {
+  // One redacted line back to the parent: the class of failure (DNS, TLS, reset,
+  // timeout) is what makes a mid-stream death diagnosable, and it carries no
+  // URL, header or body. The parent still trims it before showing it.
+  const detail = String((error && (error.code || error.name)) || 'error').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 60);
+  process.stderr.write('OFM_WORKER_REASON:' + detail + '\\n');
   process.exitCode = 1;
 }
 `;
@@ -91,6 +96,10 @@ export async function bunFetch(url, init = {}, options = {}) {
     let body;
     let header = Buffer.alloc(0);
     let receivedHeaders = false;
+    // Tracked for the close diagnostic only: it says how far the response got
+    // before the worker died, which is what tells a connect failure from a
+    // stream cut off mid-body.
+    let bytes = 0;
     let stopped = false;
     const stop = () => { if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); };
     const fail = error => {
@@ -106,13 +115,32 @@ export async function bunFetch(url, init = {}, options = {}) {
     signal?.addEventListener('abort', onAbort, { once: true });
     child.on('error', () => fail(new Error('Bun worker failed to start.')));
     child.stdin.on('error', () => fail(new Error('Bun worker input failed.')));
-    child.stderr.resume(); // Never surface diagnostics containing URLs, credentials or bodies.
+    // Worker stderr may contain URLs, credentials or bodies, so it is drained
+    // and never forwarded. The one exception is the `OFM_WORKER_REASON:` line
+    // the worker emits from its own catch: that value is already reduced to an
+    // error code, which names the failure class without any request content.
+    let reason;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', text => {
+      const match = /OFM_WORKER_REASON:([A-Za-z0-9_.-]{1,60})/.exec(text);
+      if (match && reason === undefined) reason = match[1];
+    });
+    child.stderr.on('error', () => {});
     child.stdout.on('error', () => fail(new Error('Bun worker output failed.')));
     child.on('close', code => {
       signal?.removeEventListener('abort', onAbort);
       if (!stopped) {
-        if (code !== 0 || !receivedHeaders) fail(new Error('Bun worker failed before completing the response.'));
-        else { stopped = true; body?.end(); }
+        // The worker exits non-zero for every internal failure (DNS, TLS reset,
+        // a truncated upstream body), so the bare sentence was unactionable in
+        // exactly the case that needed diagnosis: a long stream that died
+        // mid-response. Name what the parent actually observed instead — the
+        // exit code told apart a signal death (-1) from a clean failure, and
+        // `bytes`/headers locate the death relative to the response.
+        if (code !== 0 || !receivedHeaders) {
+          const seen = receivedHeaders ? `after ${bytes} response bytes` : 'before any response header';
+          const cause = reason === undefined ? '' : ` (${reason})`;
+          fail(new Error(`Bun worker exited with code ${code} ${seen}${cause}.`));
+        } else { stopped = true; body?.end(); }
       }
     });
     const onData = chunk => {
@@ -142,6 +170,9 @@ export async function bunFetch(url, init = {}, options = {}) {
           const response = new Response(webBody, { status: meta.status, statusText: meta.statusText, headers });
           receivedHeaders = true;
           if (rest.length) child.stdout.unshift(rest);
+          // Counting only here, past the metadata line, keeps the number a
+          // measure of response body received rather than of protocol overhead.
+          child.stdout.on('data', chunk => { bytes += chunk.byteLength });
           child.stdout.pipe(body, { end: false });
           resolveResponse(response);
         } else {

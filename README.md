@@ -361,6 +361,8 @@ Key 只写入插件自己的 0600 `settings.json`，接口永不回显——页�
 
 新增端点 `POST /v1/messages`（流式与非流式，`message_start` / `content_block_*` / `message_delta` / `message_stop` 正确成帧，含 `thinking` 块、`tool_use` 块、真实 `stop_reason`，以及响应头发出之后才失败时的流内 `error` 事件）与 `POST /v1/messages/count_tokens`（本地估算——插件不含 tokenizer）。Claude Code 与 Anthropic 各 SDK 因此可以直接指向本插件。原有的 `/v1/chat/completions` 与 `/v1/responses` 不变，`/v1/models` 现在广播全部车道，含聚合行与链路。网关页新增「接入客户端」分区，按实际绑定的端口与真实要求的密钥生成可复制的配方：Claude Code 环境变量、Codex `config.toml`、OpenAI SDK、Anthropic SDK、curl，以及中继开启时的局域网版本。
 
+**模型别名**：`/v1/*` 接受去掉 `-free` 的名字——`deepseek-v4.1-flash` 会路由到 `deepseek-v4.1-flash-free`，响应里的 `model` 改写回别名（流式每一帧一致）。已知 id 优先，显式 `-free` 原样透传，未知 id 仍 404；覆盖 Chat、Responses、Messages，Gemini 路径不在范围内。
+
 顺带修掉一个假成功：一轮只产出了一个调用方从未声明的工具调用时，过去会以干净的空成功收尾；现在会如实报告发生了什么——压缩器自己追加的 `[full diff: rtk git diff --no-compact]` 提示就可能让模型去调一个调用方没有的工具。
 
 
@@ -597,6 +599,8 @@ cordis context 上、真实内核则指将插件装入 dsh 后启动。三者的
 | 本轮复审：设置入口缺少类型校验 | 离线 picker-test.mjs + effort-test.mjs | probeIntervalMinutes:'abc' → Math.max(1,'abc') 为 NaN，而 setTimeout(fn, NaN) 在 Node 中等价于 1 ms：每秒执行一次全量探测。defaultMaxTokens:0（清空设置页输入框即会提交 0）→ min(容量, 0)，每轮被裁剪至 512 token，而选择器仍标注 4 K/16 K/32 K 的档位。当前数值项在 POST /settings 入口与使用处各设一道校验，非正值一律按"未设置"回落。同一批断言还固定了转发端口只能绑定回环（0.0.0.0 直接返回 400 并注明原因），以及 connection 的准入判定为逐请求读取（还原为 apply 时的一次性快照 → 该 401 断言立即失败） |
 | 本轮复审：三条"看似在测试"的套件 | 变异测试（在临时副本中逐条还原旧行为） | retry-safety-test.mjs 的四个用例全部落在"模型不在清单上"的提前返回分支（传入 model:"our-free-model/test-model-free"，而 baseModelId 仅剥离 label 不剥离路由），未发出任何请求——改为真实调用后 7 个用例逐个固定 code／是否可重试／是否触发区域重探。tui-test.mjs 的 unref 断言比较的是两个不同总体的计数（移除 120 s 循环的 unref() 后仍全绿）→ 改为按周期逐个核对。写死在套件中的端口（tui 的 18931）与另一进程争用同一端口时，表现为 180 s 静默挂起、打印出的"失败详情"为六行 ok → 端口改为取自临时端口段，runner 增加 60 s 硬超时并如实说明"该套件挂起" |
 | usage 计数正确 | 离线 retry-safety-test.mjs | 缺少 prompt_tokens_details 的 usage 不再使 inputTokens 变为 NaN；转发端口按 prompt_tokens/completion_tokens 上报，被网关拒绝的转发请求返回错误，不返回空 200。Messages 线上 message_delta 仅携带 output 一侧，旧写法会覆盖整条 usage 记录、使每个 Claude 回合的 prompt tokens 记为 0；当前改为按字段合并 |
+| 本轮：出口换节点（订阅 + 节点状态表） | 真机订阅实测 + 离线 outlet-nodes-test.mjs | 免费车道额度按出口地址计，429 时换一个节点即可再试。实现要点：mihomo 用本机二进制（可配 `mihomoPath`），分组改 `select` 由插件按 `<数据目录>/egress/nodes.json` 决定；延迟每小时测一次并升序选，**直连作为延迟 0 的成员参与同一排序**，被 429 的路径（含直连）冷却 5 小时并退出池子，全部冷却时取 429 最早者再试，切换时同时更换会话 id。**踩坑**：订阅的节点域名不在公共 DNS 里，mihomo 原配置 `dns.enable=false` 走系统解析时 71 个节点全部超时；改为读取订阅自带的 `dns:` 段（去掉 `listen:`）后 68–71 个可用，香港 214 ms |
+| 本轮：对外错误文案与 429 出口回退 | 真实 429 复现 + 离线 public-error-test.mjs / egress-failover-test.mjs | 上游 429 的整句原文（产品名、网址、升级提示）此前原样出现在 API 响应里，词表式替换只能追着已知的词跑；改为按失败类别查固定文案（`429 usage limit reached`），原文只进日志（`logUpstreamFailure`），归类不出来的错误回答 `NNN the model request failed` 而非透传。免费车道额度按出口地址计，新增 `egress.policy: 'failover'`：默认直连，429 时把同一请求体从出口重发一次，其它 4xx／超时／断流不切换；用本机 7890 以 client 模式实测，两条出口各 429 时日志留下 `retrying over the relay route`，调用方仍只收到一条 `429 usage limit reached` |
 | 本轮复审：5xx 的原因短语不再被当作判定（issue #3 的同类回归） | 离线 sniff-test.mjs + 反向验证 | stateOf 的消息兜底匹配不检查状态码，而反向代理返回 503 的标准原因短语正是 Service Unavailable——过载的网关因此被判定为"点名拒绝该模型"，模型逐个从选择器中消失（issue #3 修复的代价从消息兜底路径再度引入）。当前该兜底仅在状态码无法代表网关意图时才生效；响应体中点名模型的（含 5xx 下的 type: ModelError）仍判定为拒绝。新增 4 条断言，还原旧实现后其中 2 条立即失败 |
 
 ### 上一轮：v1.1.2（公告、升级、热重载与信任围栏）

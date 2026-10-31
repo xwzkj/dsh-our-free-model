@@ -51,7 +51,12 @@ const typed = classifyFailure(403, GATE_PAYLOAD)
 check('403 FreeTierError is a lane lock', typed.code, CODE.laneLocked)
 check('it does not read as INVALID_CREDENTIAL', typed.code === CODE.credential, false)
 check('it keeps the upstream type', typed.type, 'FreeTierError')
-check('it keeps the upstream message', typed.message, GATE_PAYLOAD.error.message)
+// The gate's words name the supplier, so the caller reads the class instead —
+// and the sentence itself is not lost, it moved to the log (`rawMessage`).
+check('the caller reads the class, not the supplier prose',
+  typed.message, '403 this client is not allowed to use the model')
+check('…while the upstream sentence survives for the log',
+  typed.rawMessage, GATE_PAYLOAD.error.message)
 
 // The upstream may spell the same gate without the structured type; the prose
 // alone must classify the same way, or a wire change re-opens the hole.

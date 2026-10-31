@@ -56,6 +56,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
+import {
+  DEFAULT_COOLDOWN_HOURS, DIRECT_ROUTE, loadNodeTable, noteNode429, noteNodeDelay, noteNodeSuccess,
+  oldestLimitedNode, rankNodes, routeCandidates, saveNodeTable,
+} from './outlet-nodes.js'
 import { spawn } from 'node:child_process'
 import { bunFetch, findBunExecutable } from './bun-fetch.js'
 import { restrictPermissions } from './open-external.js'
@@ -96,6 +100,223 @@ export function egressActive() {
 }
 
 /**
+ * How the running outlet is used, once it is up.
+ *
+ * `always` is the historical behaviour: the outlet exists, so everything goes
+ * through it. `failover` starts it and then leaves it idle — the default route
+ * stays direct, and only an attempt that the gateway refused with 429 is moved
+ * onto the outlet, where a different exit address may still have pool left.
+ */
+export function egressPolicy() {
+  const relay = activeRelay
+  if (relay === null || relay.dead) return 'off'
+  return relay.policy?.() === 'failover' ? 'failover' : 'always'
+}
+
+/**
+ * Which outlets one upstream attempt may use, in order, as route descriptors.
+ *
+ * One pool, one ordering: `routeCandidates` ranks every path by latency, with
+ * the direct connection entered at zero, and leaves out whatever said 429 inside
+ * the cooldown window. So a healthy direct always comes first, a refused direct
+ * disappears for five hours, and the turn falls through to the fastest node —
+ * the same rule for both kinds of exit, which is what makes the behaviour easy
+ * to reason about from the log alone.
+ *
+ * `always` keeps its old meaning (everything through the outlet) and simply
+ * takes the best node as its only rung.
+ */
+export function outletRoutePlan() {
+  const relay = activeRelay
+  const cooldownHours = relay?.cooldownHours?.() ?? DEFAULT_COOLDOWN_HOURS
+  const attempts = relay?.maxAttempts?.() ?? 3
+  if (relay === null || relay.dead) return [{ kind: 'direct' }]
+  if (egressPolicy() === 'always') {
+    const best = rankNodes(relay.nodes, { cooldownHours })[0]
+    return best === undefined ? [{ kind: 'relay' }] : [{ kind: 'node', node: best }]
+  }
+  const candidates = routeCandidates(relay.nodes, { cooldownHours }).slice(0, Math.max(1, attempts))
+  const plan = candidates.map(route => (route.direct ? { kind: 'direct' } : { kind: 'node', node: route.name }))
+  if (plan.length > 1) return plan
+  // Nothing measured yet (the first seconds after boot): still give the turn one
+  // rung it can fall back to, instead of refusing it with no alternative tried.
+  const measured = Object.keys(relay.nodes.nodes ?? {}).filter(name => name !== DIRECT_ROUTE).length
+  if (measured === 0) return [...plan, { kind: 'relay' }]
+  if (plan.length === 0) {
+    // Everything, direct included, is cooling: retry the entry whose window is
+    // closest to expiring rather than refusing the turn untried.
+    const oldest = oldestLimitedNode(relay.nodes)
+    return oldest === null ? [] : [{ kind: 'node', node: oldest }]
+  }
+  return plan
+}
+
+/**
+ * Pin the managed outlet on one node.
+ *
+ * Serialized by the caller's single-threaded turn, and skipped when the group is
+ * already there: a switch is a controller round-trip and every turn would pay
+ * for it. Returns `false` when there is no managed outlet or the controller
+ * refused — the caller then skips that rung rather than sending the turn through
+ * whatever node happened to be selected.
+ */
+export async function applyOutletNode(name, relay = activeRelay) {
+  const managed = relay?.managed
+  if (managed === null || managed === undefined) return false
+  const target = typeof name === 'string' ? name : ''
+  if (target === '') return false
+  if (relay.pinned === target) return true
+  try {
+    await controllerJson(managed, '/proxies/ofm-outlet', 5000, { method: 'PUT', body: JSON.stringify({ name: target }) })
+    relay.pinned = target
+    return true
+  } catch (error) {
+    relay.log?.(`node "${target}" could not be selected (${error?.message ?? error})`)
+    return false
+  }
+}
+
+/** The turn was refused with 429 through `name`: stamp it for the five-hour rule. */
+export function markOutlet429(name, relay = activeRelay) {
+  if (relay === null || typeof name !== 'string' || name === '') return
+  noteNode429(relay.nodes, name)
+  persistNodes(relay)
+}
+
+/**
+ * The turn was served through `name`: clear its failure counter.
+ *
+ * Memory only, on purpose — this runs once per served turn and the book is
+ * already written on every 429 and on every hourly measurement. A per-turn fsync
+ * would buy nothing: the counter it clears is a routing hint, not a record.
+ */
+export function markOutletSuccess(name, relay = activeRelay) {
+  if (relay === null || typeof name !== 'string' || name === '') return
+  noteNodeSuccess(relay.nodes, name)
+}
+
+function persistNodes(relay) {
+  try {
+    saveNodeTable(relay.dataDir, relay.nodes)
+  } catch (error) {
+    relay.log?.(`the node book could not be written (${error?.message ?? error})`)
+  }
+}
+
+/**
+ * Measure every node and write the readings into the book.
+ *
+ * The provider's health-check is the only bulk measurement mihomo offers, and it
+ * is also the only one that works for provider nodes (`/proxies/<name>/delay`
+ * answers 404 for those). Measured cost on a 71-node subscription: ~13-35 s, so
+ * callers run this in the background — never on a turn's path.
+ */
+export async function refreshOutletNodes(relay = activeRelay, { timeoutMs = 120_000, waitMs = 45_000, now = Date.now() } = {}) {
+  const managed = relay?.managed
+  if (managed === null || managed === undefined) return null
+  // The provider is fetched by mihomo *after* it starts, so the first call after
+  // boot can arrive before a single node exists. Waiting is the difference
+  // between "the outlet has no nodes" and "the outlet has not read its
+  // subscription yet" — the first is a real fault, the second is a few seconds.
+  const proxies = await waitForProvider(managed, waitMs)
+  if (proxies.length === 0) {
+    relay.log?.('the subscription has produced no nodes yet; will measure again on the next interval')
+    return null
+  }
+  const target = encodeURIComponent('http://www.gstatic.com/generate_204')
+  await controllerJson(managed, `/providers/proxies/egress/healthcheck?timeout=5000&url=${target}`, timeoutMs).catch(() => null)
+  // The health-check rewrites each node's `history`; read it back rather than
+  // the pre-check snapshot, or every node keeps whatever it measured last time.
+  const measuredList = await controllerJson(managed, '/providers/proxies/egress', 6000).catch(() => null)
+  const latest = Array.isArray(measuredList?.proxies) && measuredList.proxies.length > 0 ? measuredList.proxies : proxies
+  let measured = 0
+  for (const proxy of latest) {
+    const name = typeof proxy?.name === 'string' ? proxy.name : ''
+    if (name === '') continue
+    const delayMs = lastDelay(proxy) ?? 0
+    noteNodeDelay(relay.nodes, name, delayMs, now)
+    if (delayMs > 0) measured += 1
+  }
+  relay.nodes.updatedAt = now
+  persistNodes(relay)
+  relay.log?.(`node measurement: ${measured}/${latest.length} reachable`)
+  // `always` has no per-attempt pin, so it needs one good default or the first
+  // catalog fetch walks out through whatever node the group happened to hold.
+  if (relay.policy?.() !== 'failover') {
+    const best = rankNodes(relay.nodes, { cooldownHours: relay.cooldownHours?.() })[0]
+    if (best !== undefined) await applyOutletNode(best, relay)
+  }
+  return { measured, total: latest.length, at: now }
+}
+
+/**
+ * The subscription's own `dns:` block, taken verbatim.
+ *
+ * Text, not YAML: the block is already correctly nested, and re-emitting it from
+ * a parsed form would mean shipping a YAML writer for one section. `listen:` is
+ * dropped — its port is the host's own resolver's business, not ours — and the
+ * scan stops at the next key at column zero.
+ */
+function dnsBlockFrom(text) {
+  const lines = String(text).split('\n')
+  const start = lines.findIndex(line => /^dns:/.test(line))
+  if (start === -1) return ''
+  const block = []
+  for (let index = start; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (index > start && line !== '' && !line.startsWith(' ')) break
+    if (/^\s*listen:/.test(line)) continue
+    block.push(line)
+  }
+  while (block.length > 0 && block[block.length - 1].trim() === '') block.pop()
+  return block.length > 1 ? block.join('\n') : ''
+}
+
+/** Poll until the provider has nodes; the subscription load is asynchronous. */
+async function waitForProvider(managed, waitMs) {
+  const deadline = Date.now() + Math.max(0, waitMs)
+  for (;;) {
+    const provider = await controllerJson(managed, '/providers/proxies/egress', 6000).catch(() => null)
+    const proxies = Array.isArray(provider?.proxies) ? provider.proxies : []
+    if (proxies.length > 0) return proxies
+    if (Date.now() >= deadline) return []
+    await new Promise(resolve => setTimeout(resolve, 1000))
+  }
+}
+
+/** Best effort: a subscription that cannot be read leaves the system resolver in place. */
+async function subscriptionDns(url, log) {
+  try {
+    const response = await fetch(url, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(20_000),
+      headers: { 'user-agent': 'clash.meta', accept: 'application/yaml, text/yaml, text/plain, */*' },
+    })
+    if (!response.ok) {
+      log(`the subscription answered ${response.status}; node hostnames will use the system resolver`)
+      return ''
+    }
+    const text = await response.text()
+    const block = text.length > 4_000_000 ? '' : dnsBlockFrom(text)
+    if (block === '') log('the subscription carries no dns block; node hostnames will use the system resolver')
+    return block
+  } catch (error) {
+    log(`the subscription could not be read for its dns block (${error?.message ?? error}); node hostnames will use the system resolver`)
+    return ''
+  }
+}
+
+/** Resolve the relay an attempt should use, honouring an explicit choice. */
+function outletRelayFor(outlet) {
+  if (activeRelay === null || activeRelay.dead) return null
+  if (outlet === 'direct') return null
+  if (outlet === 'relay') return activeRelay
+  // No explicit choice: under failover the direct path is the default, so an
+  // unannotated caller (catalog refresh, exit-IP probe) keeps going straight out.
+  return egressPolicy() === 'failover' ? null : activeRelay
+}
+
+/**
  * `fetch`, through the outlet when one is running and straight out when not.
  *
  * The rewrite is deliberately boring: same method, same body, same signal, plus
@@ -103,8 +324,8 @@ export function egressActive() {
  * origin-form the loopback relay serves. Call sites keep `redirect: 'error'` in
  * `init`, so a 3xx is a response, never a second hop that would dodge the outlet.
  */
-export async function egressFetch(url, init) {
-  const relay = activeRelay
+export async function egressFetch(url, init, { outlet } = {}) {
+  const relay = outletRelayFor(outlet)
   const targetUrl = new URL(url instanceof Request ? url.url : String(url))
   // Only the official OC inference lane uses Bun. Kilo/EAC/catalogs and local
   // test endpoints keep their existing fetch path. Never retry a failed turn
@@ -116,7 +337,6 @@ export async function egressFetch(url, init) {
     if (transport !== 'auto' && transport !== 'bun') throw new Error('OUR_FREE_MODEL_FREE_TRANSPORT must be auto, bun, or node')
     const executable = findBunExecutable()
     if (!executable) throw new Error('OpenCode free inference requires a local Bun executable; install Bun or set OUR_FREE_MODEL_BUN to its executable path (OUR_FREE_MODEL_FREE_TRANSPORT=node restores the legacy transport)')
-    if (relay?.dead) throw new Error('the configured egress relay is not running')
     const proxy = relay ? `http://ofm:${relay.key}@${RELAY_HOST}:${relay.port}` : undefined
     if (url instanceof Request) {
       const request = new Request(url, init)
@@ -179,6 +399,10 @@ export async function startEgressRelay({ config, dataDir, log = () => {}, onDead
     // outlet URL below, never in the rendered config the user can read.
     const outletAuth = `ofm:${randomBytes(12).toString('hex')}`
     const configPath = path.join(dir, 'mihomo.yaml')
+    // Read the subscription once, for its resolver only: the node hostnames are
+    // not in public DNS and the provider steers the answers through a
+    // per-account DoH. mihomo still owns the node list (the provider refresh).
+    const dnsBlock = await subscriptionDns(url, log)
     fs.writeFileSync(configPath, renderMihomoConfig({
       subscription: url,
       mixedPort,
@@ -186,6 +410,7 @@ export async function startEgressRelay({ config, dataDir, log = () => {}, onDead
       secret,
       auth: outletAuth,
       logFile: path.join(dir, 'mihomo.log'),
+      dnsBlock,
     }), { mode: 0o600 })
     restrictPermissions(configPath)
     child = spawn(binary, ['-d', dir, '-f', configPath], { windowsHide: true, stdio: 'ignore' })
@@ -242,6 +467,23 @@ export async function startEgressRelay({ config, dataDir, log = () => {}, onDead
     managed,
     child,
     log,
+    dataDir,
+    /** What each node measured, and when it last said 429 (src/outlet-nodes.js). */
+    nodes: loadNodeTable(dataDir),
+    /** The node currently pinned on the select group, if any. */
+    pinned: '',
+    // Read through to the live settings rather than frozen at start: flipping
+    // between "everything through the outlet" and "direct first" re-routes the
+    // next attempt without taking the outlet (and its mihomo) down.
+    policy: () => (config().policy === 'failover' ? 'failover' : 'always'),
+    cooldownHours: () => {
+      const hours = Number(config().nodeCooldownHours)
+      return Number.isFinite(hours) && hours >= 0 ? hours : DEFAULT_COOLDOWN_HOURS
+    },
+    maxAttempts: () => {
+      const attempts = Number(config().maxAttempts)
+      return Number.isInteger(attempts) && attempts > 0 ? Math.min(attempts, 5) : 3
+    },
     /** Set when the managed child dies after startup; the settings page shows it. */
     dead: '',
     close: async () => {
@@ -727,7 +969,7 @@ function sameSecret(given, expected) {
  * same way the relay key protects the loopback port in front of it: a listener
  * every local process can borrow is a listener that will be borrowed.
  */
-export function renderMihomoConfig({ subscription, mixedPort, apiPort, secret, auth, logFile }) {
+export function renderMihomoConfig({ subscription, mixedPort, apiPort, secret, auth, logFile, dnsBlock }) {
   return [
     '# Managed by dsh-our-free-model. Edits are overwritten on the next sync.',
     `mixed-port: ${mixedPort}`,
@@ -744,8 +986,14 @@ export function renderMihomoConfig({ subscription, mixedPort, apiPort, secret, a
     ...(logFile === undefined ? [] : [`log-file: ${JSON.stringify(logFile)}`]),
     `external-controller: ${RELAY_HOST}:${apiPort}`,
     `secret: ${JSON.stringify(secret)}`,
-    'dns:',
-    '  enable: false',
+    // The subscription's own resolver, verbatim. Node hostnames are not in
+    // public DNS: the provider answers them through a per-account DoH, and the
+    // system resolver returns addresses that do not accept the node ports
+    // (measured: 0/71 reachable with system DNS, 65/71 with this block). The
+    // block is copied rather than re-derived because the answers are steered per
+    // account; `listen:` is stripped by the extractor so we never fight the
+    // host's own resolver for a port.
+    ...(dnsBlock === undefined || dnsBlock === '' ? ['dns:', '  enable: false'] : dnsBlock.split('\n')),
     'proxy-providers:',
     '  egress:',
     '    type: http',
@@ -760,12 +1008,13 @@ export function renderMihomoConfig({ subscription, mixedPort, apiPort, secret, a
     '      expected-status: 204',
     'proxy-groups:',
     '  - name: ofm-outlet',
-    '    type: url-test',
+    // `select`, not `url-test`: the choice is made by src/outlet-nodes.js from a
+    // table that remembers 429s, and a url-test group would re-rank every few
+    // minutes and overwrite the pin. The provider's own health-check still runs
+    // (it is what fills in `history` for the hourly measurement).
+    '    type: select',
     '    use:',
     '      - egress',
-    '    url: "http://www.gstatic.com/generate_204"',
-    '    interval: 300',
-    '    tolerance: 50',
     'rules:',
     '  - MATCH,ofm-outlet',
     '',
@@ -896,14 +1145,20 @@ function lastDelay(proxy) {
   return typeof delay === 'number' && delay > 0 ? delay : undefined
 }
 
-function controllerJson(managed, path, timeoutMs) {
+function controllerJson(managed, path, timeoutMs, { method = 'GET', body = null } = {}) {
   return new Promise((resolve, reject) => {
+    const headers = { authorization: `Bearer ${managed.secret}` }
+    if (body !== null) {
+      headers['content-type'] = 'application/json'
+      headers['content-length'] = Buffer.byteLength(body)
+    }
     const request = http.request(
       {
         host: RELAY_HOST,
         port: managed.apiPort,
         path,
-        headers: { authorization: `Bearer ${managed.secret}` },
+        method,
+        headers,
         timeout: timeoutMs,
       },
       response => {
@@ -911,6 +1166,13 @@ function controllerJson(managed, path, timeoutMs) {
         response.setEncoding('utf8')
         response.on('data', chunk => { body += chunk })
         response.on('end', () => {
+          // 204 is the controller's "done, nothing to say" (a group switch, a
+          // health-check trigger); an empty 200 body is the same thing spelled
+          // differently by some builds.
+          if (response.statusCode === 204 || (response.statusCode === 200 && body.trim() === '')) {
+            resolve(null)
+            return
+          }
           if (response.statusCode !== 200) {
             reject(new Error(`mihomo controller ${path} answered ${response.statusCode}`))
             return
@@ -925,6 +1187,9 @@ function controllerJson(managed, path, timeoutMs) {
     )
     request.on('timeout', () => request.destroy(new Error(`mihomo controller ${path} timed out`)))
     request.on('error', reject)
-    request.end()
+    // The body has to be written, not just declared: a PUT carrying a
+    // `content-length` and no bytes makes the controller wait for the rest of
+    // the request until the timeout kills it.
+    request.end(body === null ? undefined : body)
   })
 }

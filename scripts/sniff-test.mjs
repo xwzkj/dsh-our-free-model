@@ -124,7 +124,8 @@ check('everything past the 4 K sniff window still arrives', framesOf(overflow.pa
 // ── what is genuinely not a stream still takes the old paths ─────────────────
 scripts.set('deepseek-v4-flash-free', { contentType: 'application/json', status: 400, body: JSON.stringify({ error: { type: 'ModelError', message: 'Model is unavailable.' } }) })
 check('a refused model is still a classified refusal', (await ask('deepseek-v4-flash-free')).error?.code, CODE.server)
-check('and still says the model is unavailable', (await ask('deepseek-v4-flash-free')).error?.message, 'Model is unavailable.')
+check('and still says the model is unavailable',
+  (await ask('deepseek-v4-flash-free')).error?.message, '400 the upstream gateway failed')
 
 scripts.set('nemotron-3-ultra-free', { contentType: 'application/json', body: JSON.stringify({ id: 'resp-1', status: 'completed' }) })
 const single = await ask('nemotron-3-ultra-free')

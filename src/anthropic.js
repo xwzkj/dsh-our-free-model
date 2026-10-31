@@ -597,7 +597,7 @@ export function anthropicFrames(chunk, state) {
       // out, because a stop_reason would claim the turn ended on purpose.
       if (reason.kind === 'error' || reason.kind === 'aborted') {
         const carried = string(reason.failure?.message)
-        const message = carried !== '' ? carried : reason.kind === 'aborted' ? 'request aborted' : 'our free model failed the turn'
+        const message = carried !== '' ? carried : reason.kind === 'aborted' ? 'request aborted' : 'the model service failed the turn'
         state.stopReason = null
         const failure = carryFailure(reason.failure, reason.kind)
         frames.push(sseFrame('error', { type: 'error', error: forwardFailure({ error: message, failure }, true).error }))

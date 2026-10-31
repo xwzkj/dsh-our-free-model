@@ -6,7 +6,7 @@
  */
 import crypto from 'node:crypto'
 import { foldAnthropicOutcome, countTokens } from './anthropic.js'
-import { forwardFailure } from './failure.js'
+import { forwardFailure, sanitizeErrorMessage } from './failure.js'
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const invalid = message => { throw Object.assign(new Error(message), { statusCode: 400 }) }
@@ -40,7 +40,7 @@ export function geminiError(res, code, message) {
     429: 'RESOURCE_EXHAUSTED', 499: 'CANCELLED', 500: 'INTERNAL',
     502: 'UNAVAILABLE', 503: 'UNAVAILABLE', 504: 'DEADLINE_EXCEEDED',
   }[code] ?? 'UNKNOWN'
-  const payload = { error: { code, message: String(message), status } }
+  const payload = { error: { code, message: sanitizeErrorMessage(message), status } }
   if (res.destroyed || res.writableEnded) return
   if (res.headersSent) {
     res.end(`data: ${JSON.stringify(payload)}\n\n`)

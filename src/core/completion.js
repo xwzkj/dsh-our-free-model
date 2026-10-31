@@ -11,22 +11,46 @@ export function routableModelIds(snapshot) {
   return membership
 }
 
+/**
+ * The stripped spelling of a `-free` id, or `undefined` when the id keeps no
+ * suffix. Chat clients that reject or de-prioritise "free" names ask for
+ * `deepseek-v4.1-flash`; the forward listener already routes that name to the
+ * `-free` sibling (see `resolveForwardModel`), so the catalogue advertises the
+ * same two names the listener accepts.
+ */
+export function aliasIdOf(id) {
+  const value = String(id ?? '')
+  if (value === '' || !value.endsWith('-free')) return undefined
+  const stripped = value.slice(0, -'-free'.length)
+  return stripped === '' ? undefined : stripped
+}
+
 export function publicModelRows(snapshot) {
   const membership = routableModelIds(snapshot)
-  return snapshot.catalog
-    .filter(entry => membership.has(entry.id))
-    .map(entry => {
-      const efforts = effortsFor(entry, undefined, snapshot.settings.defaultMaxTokens)
-      return {
-        id: entry.id, object: 'model',
-        created: Math.floor(Date.now() / 1000), owned_by: 'our-free-model',
-        ...entry.contextWindow === undefined ? {} : { context_window: entry.contextWindow },
-        ...efforts === undefined ? {} : {
-          x_ofm_efforts: efforts.map(effort => effort.id),
-          x_ofm_effort_default: defaultEffortFor(entry),
-        },
-      }
-    })
+  const rows = []
+  const listed = new Set()
+  for (const entry of snapshot.catalog) {
+    if (!membership.has(entry.id)) continue
+    const efforts = effortsFor(entry, undefined, snapshot.settings.defaultMaxTokens)
+    const row = {
+      id: entry.id, object: 'model',
+      created: Math.floor(Date.now() / 1000), owned_by: 'our-free-model',
+      ...entry.contextWindow === undefined ? {} : { context_window: entry.contextWindow },
+      ...efforts === undefined ? {} : {
+        x_ofm_efforts: efforts.map(effort => effort.id),
+        x_ofm_effort_default: defaultEffortFor(entry),
+      },
+    }
+    rows.push(row)
+    listed.add(entry.id)
+    const alias = aliasIdOf(entry.id)
+    // A real catalogue id always wins: never advertise a shadow for a name the
+    // listener would route somewhere else.
+    if (alias === undefined || listed.has(alias) || membership.has(alias)) continue
+    rows.push({ ...row, id: alias, x_ofm_alias: entry.id })
+    listed.add(alias)
+  }
+  return rows
 }
 
 /** 固定本次请求的模型和配置快照，两个入口使用同一条推理链路。 */

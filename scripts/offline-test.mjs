@@ -114,7 +114,11 @@ const dataDir = home => path.join(home, 'our-free-model')
   })) chunks.push(chunk)
   const finish = chunks.find(chunk => chunk.type === 'finish')?.reason
   check('a turn ends as an upstream error, not an exception', finish?.kind, 'error')
-  check('with the transport failure named', /upstream|fetch|ECONNREFUSED|request failed/i.test(finish?.failure?.message ?? ''), true)
+  check('with the transport failure named',
+    finish?.failure?.message, 'the connection to the model service failed')
+  // The detail (host, errno) is for the log, not for the caller.
+  check('…and the raw detail kept out of the reply',
+    /upstream|fetch|ECONNREFUSED|request failed/i.test(finish?.failure?.message ?? ''), false)
 
   // The forward listener is part of the no-key promise: other local harnesses
   // get an OpenAI endpoint that needs only its own bearer, minted locally.

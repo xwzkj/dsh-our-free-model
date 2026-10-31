@@ -435,7 +435,7 @@ check('aborted -> an error event and message_stop, with no message_delta', () =>
 })
 
 check('an error with no message falls back to a readable one', () => {
-  assert.equal(finishOf({ kind: 'error' }).parsed[1].payload.error.message, 'our free model failed the turn')
+  assert.equal(finishOf({ kind: 'error' }).parsed[1].payload.error.message, 'the model service failed the turn')
   assert.equal(finishOf({ kind: 'aborted' }).parsed[1].payload.error.message, 'request aborted')
 })
 

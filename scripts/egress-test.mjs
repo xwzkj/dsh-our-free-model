@@ -338,8 +338,16 @@ async function main() {
   const yaml = renderMihomoConfig({ subscription: 'https://example.com/s/tok', mixedPort: 33001, apiPort: 33002, secret: 'shh', logFile: 'C:/x/m.log' })
   check(yaml.includes('type: http') && yaml.includes('https://example.com/s/tok'), 'provider carries the subscription url')
   check(yaml.includes('expected-status: 204') && yaml.includes('generate_204'), 'health-check prunes non-204 (429) nodes')
-  check(yaml.includes('type: url-test') && yaml.includes('- MATCH,ofm-outlet'), 'group is url-test and rules route through it')
+  // `select`, not `url-test`: the node is chosen from src/outlet-nodes.js, whose
+  // book remembers 429s; a url-test group would re-rank and overwrite the pin.
+  check(yaml.includes('type: select') && yaml.includes('- MATCH,ofm-outlet'), 'group is select (the book chooses) and rules route through it')
+  check(!yaml.includes('type: url-test'), 'no self-reranking group is left to overwrite the pin')
+  // The subscription's resolver is carried verbatim, minus its listener.
+  const withDns = renderMihomoConfig({ subscription: 'https://example.com/s/tok', mixedPort: 33001, apiPort: 33002, secret: 'shh', dnsBlock: 'dns:\n  enable: true\n  nameserver:\n    - https://223.5.5.5/dns-query' })
+  check(withDns.includes('nameserver:') && withDns.includes('223.5.5.5'), 'the provider resolver reaches the config')
+  check(!withDns.includes('enable: false'), 'and replaces the disabled resolver')
   check(yaml.includes('mixed-port: 33001') && yaml.includes('external-controller: 127.0.0.1:33002'), 'ports land in the config')
+  check(yaml.includes('dns:\n  enable: false'), 'without a subscription resolver, DNS stays off')
   // Confinement: this outlet serves the plugin's own opencode traffic only. It
   // must never listen off-loopback, never register a system proxy, never take
   // over routing via TUN.

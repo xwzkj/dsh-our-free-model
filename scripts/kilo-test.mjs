@@ -241,7 +241,7 @@ try {
 } catch (error) { paidFailure = error }
 check('a paid id keyless fails as a plain request defect', paidFailure?.code, 'CLIENT_ERROR')
 check('with the message naming the lane, not a credential store',
-  /not on the free pool/.test(paidFailure?.message ?? ''), true)
+  /requires an account/.test(paidFailure?.message ?? ''), true)
 
 // Drive actual catalog refreshes; an HTTP success with no free models is an
 // authoritative roster, while a failed listing is not an empty-pool signal.

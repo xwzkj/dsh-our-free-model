@@ -66,6 +66,21 @@ OpenCode 免费车道的请求默认交给本机 Bun 可执行文件发送，插
 `node` 回退，再怀疑额度。`OUR_FREE_MODEL_FREE_TRANSPORT=node` 只用于诊断。
 Kilo 车道不需要 Bun，两条传输都正常。
 
+**Bun worker 中途退出时怎么读报错**：传输失败会写成
+`upstream request failed: Bun worker exited with code <N> after <N> response bytes (ENOTFOUND).`
+括号里是 worker 自己 `catch` 到的错误码（DNS、`ECONNRESET`、`ETIMEDOUT` 等），
+`after ... bytes` 说明死在响应中途还是连接阶段。worker 的 stderr 只回传这一行错误码，
+URL、请求头和正文一律不落到日志里。
+
+**上游排队后不回包就断开**：2026-10-31 实测，网关会为排队中的请求保持约 65 秒，
+然后在不发送任何响应字节的情况下直接断开（worker 报 `ECONNRESET`）。这在客户端看
+是 `Bun worker exited with code 1 before any response header (ECONNRESET)`。因为此时
+还没有向客户端写过任何字节、请求体也已序列化好，服务会**立即重放一次**；重放仍被
+断开才按传输错误返回，并写成
+`upstream request failed: fetch failed — … (the gateway reset the connection before answering)`。
+重放只针对「连接在响应头之前被重置」，真正的拒绝（有状态码）、客户端取消和第二次
+重置都不会被重试。
+
 ## 会话保持（每个对话独立的上游会话）
 
 免费车道按上游会话区分状态与额度。独立服务不会再把所有下游请求塞进同一个
@@ -92,6 +107,23 @@ Kilo 车道不需要 Bun，两条传输都正常。
 
 会话保持只解决“不同对话共用一个上游会话”的问题，不放宽上游的限额与条款：
 同一出口 IP 的 429 不会因为换会话而消失；Kilo 免费池的提示词仍可能被上游记录。
+
+## 去掉 `-free` 的模型别名
+
+请求 `deepseek-v4.1-flash` 会自动路由到 `deepseek-v4.1-flash-free`，响应里的
+`model` 字段改写回 `deepseek-v4.1-flash`；流式响应的每一帧同样如此。覆盖
+Chat Completions、Responses 与 Messages 三条下游协议。
+
+- 只在 `-free` 兄弟 id **确实可路由**时生效；请求的 id 本身存在时优先用它。
+- 已经带 `-free` 的请求原样透传，不会被二次改写。
+- `/v1/models` 两种写法都列出：`deepseek-v4.1-flash-free` 与
+  `deepseek-v4.1-flash`。别名行带 `x_ofm_alias` 指向真实 id，客户端在列表里
+  直接选哪一个都能用；new-api 里手填去掉 `-free` 的名字同样有效。
+- Gemini 路径（`/v1beta/models/...`）不在这个别名范围内。
+- 对外错误消息会去掉 `Our Free Model`、`free model`、`free tier`、
+  `FreeUsageLimitError` 等内部名；模型 id 里的 `-free`/`:free` 也会在报错文本中
+  显示为去掉后缀的形式（如 `deepseek-v4.1-flash`），只有 HTTP 状态、错误类型和
+  必要参数保留。
 
 ## 局域网推理
 
@@ -232,7 +264,136 @@ Kilo 免费池的提示词可能被上游记录，请勿发送敏感内容。
 
 这两条渠道的登录、续期和模型请求会读取 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`；没有环境代理时，Windows 自动读取当前用户的手动系统代理。环境代理遵守 `NO_PROXY`，系统代理遵守 `ProxyOverride`，回环请求不自动使用代理。无需设置 `NODE_USE_ENV_PROXY`。
 
-Windows 手动代理配置最多缓存 30 秒；PAC 自动配置脚本不在支持范围内。独立服务尚未提供插件的订阅出口功能，使用环境代理或手动系统代理即可。Gemini 需要能访问 Google 的授权、令牌、身份和 Code Assist 端点；浏览器授权成功不代表后台连接成功，网络错误会显示连接路径和底层错误码。
+Windows 手动代理配置最多缓存 30 秒；PAC 自动配置脚本不在支持范围内。Gemini 需要能访问 Google 的授权、令牌、身份和 Code Assist 端点；浏览器授权成功不代表后台连接成功，网络错误会显示连接路径和底层错误码。免费车道的出口见下一节。
+
+## 出口与 429 故障转移
+
+免费车道的额度按**出口地址**计算，同一出口的 429 不会因为换会话而消失。独立服务
+因此支持一个本地出口：默认直连，被 429 拒绝时换一个节点再试。
+
+### 配置
+
+管理页暂未提供入口，直接编辑 `settings.json` 后重启服务：
+
+```json
+"egress": {
+  "enabled": true,
+  "mode": "subscription",
+  "policy": "failover",
+  "url": "<订阅链接>",
+  "mihomoPath": "",
+  "nodeCooldownHours": 5,
+  "delayRefreshMinutes": 60,
+  "maxAttempts": 3
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `enabled` | 是否把出口跑起来。关闭即完全直连，其余字段不生效 |
+| `mode` | `subscription` 由本服务拉起 mihomo 加载订阅；`client` 直接拨一个现成代理（如 `http://127.0.0.1:7890`），不能换节点 |
+| `policy` | `always` 全部走出口（旧行为）；`failover` 默认直连，429 才切 |
+| `url` | 订阅链接或代理地址。含凭据，只写不读，日志只显示主机名 |
+| `mihomoPath` | 留空则在 `PATH` 与常见安装目录里查找 |
+| `nodeCooldownHours` | 一个节点被 429 后要冷却多久，默认 5 |
+| `delayRefreshMinutes` | 延迟测量间隔，默认 60 分钟 |
+| `maxAttempts` | 一个回合最多试几个出口，默认 3（直连 + 2 个节点） |
+
+**mihomo 用本机已有的二进制**，不随包分发：`/usr/local/bin/mihomo`、`PATH` 里的
+`mihomo`，或 `mihomoPath` 指定的路径。缺失时报错指向该字段，不会静默失败。
+
+### 节点域名必须用订阅自带的 DNS 解析
+
+这是本功能唯一一个真正容易踩的坑。订阅里的节点主机名**不在公共 DNS 里**：用系统
+解析器拿到的地址不接受节点端口，表现为"所有节点都超时"。实测同一份订阅：
+
+| 解析方式 | 结果 |
+| --- | --- |
+| 系统解析器 | 71 个节点全部 TCP 超时 |
+| 订阅自带的 DoH 段 | 68–71 个可用，香港 214 ms、新加坡 324 ms |
+
+因此服务会读取订阅里的 `dns:` 段并原样写进自己的 mihomo 配置（只去掉 `listen:`，
+避免和本机解析器抢端口）。订阅读不到时退回系统解析并写一条日志，节点多半不可用。
+
+### 选哪个节点：一个池子，按延迟排
+
+**直连也是池子里的一员，延迟记为 0。** 收到请求时，取"上次 429 已超过 5 小时"的节点中
+延迟最低的那个发起；任何一条路径被 429，它就像节点一样冷却 5 小时并退出池子，下一次
+按同样的规则重选，最多重试 `maxAttempts - 1` 次（默认共 3 次尝试）。切换路径时同时
+换一个新的会话 id。
+
+因为直连的延迟是 0，健康时它永远排第一；一旦它 429，接下来五个小时所有回合都直接从
+最快的节点起步，日志里会写一行：
+
+```
+our-free-model: starting on "🇭🇰1香港-专线(AnyTLS)" (the direct route is cooling)
+```
+
+mihomo 的分组是 `select`，节点由插件决定而不是让 mihomo 自己 `url-test` 重排——因为
+选择要记住 429，而 `url-test` 只记得最近一次延迟。
+
+`<数据目录>/egress/nodes.json`（0600）记录每个路径，`direct` 也在其中：
+
+```jsonc
+{ "version": 1, "updatedAt": 1793449637001,
+  "nodes": {
+    "direct": { "delayMs": 0, "last429At": 1793449000000 },
+    "🇭🇰1香港-专线(AnyTLS)": { "delayMs": 213, "delayAt": 1793449637001, "last429At": 0, "lastFailAt": 0, "fails": 0 }
+  } }
+```
+
+- **延迟**：每小时测量一次（`delayRefreshMinutes`），升序选；旧读数只是排序提示，不会因此排除节点
+- **429**：`last429At` 在 `nodeCooldownHours`（默认 5 小时）内排除该路径；过了窗口自动回到池子
+- **连接失败**：只冷却 10 分钟。这条只作用于节点，不作用于直连——出站被重置说明不了本机地址有问题
+- **全部冷却**：取 429 最早的那条再试一次，而不是直接放弃
+
+### 一次 429 会发生什么
+
+```
+第 1 次：直连              429 → 直连冷却 5 小时、换会话 id
+第 2 次：🇭🇰1香港 (213ms)   429 → 该节点冷却、换会话 id
+第 3 次：🇭🇰2香港 (213ms)   429 → 到达 maxAttempts，交还失败
+```
+
+429 时请求没被受理、没生成内容，重发是安全的；其它 4xx 是请求本身的问题，换地址也
+是同样的答案，超时与断流同样不切换。切换各留一行日志，原始报错也留在日志里：
+
+```
+our-free-model: code=RATE_LIMIT status=429 raw="Free usage limit reached. Free models work in OpenCode ..."
+our-free-model: RATE_LIMIT from the direct route; retrying over "🇭🇰2香港-专线(AnyTLS)" with a fresh session
+```
+
+**会话 id 为什么要换**：它按 `ses_<反向时间戳><base62>` 的编码被上游校验，是我们自己铸的；
+同一个 id 被拒后再拿去新地址试，等于把旧账带过去。只有重试那一跳换，正常回合沿用对话
+自己的 id，上游 KV 缓存不受影响。
+
+### 托管细节
+
+配置写在 `<数据目录>/egress/mihomo.yaml`，混合端口与控制器端口随机分配且都带本机
+凭据；订阅与 DNS 段都在这份 0600 文件里。子进程退出会写日志。`client` 模式不托管
+任何进程。
+
+## 对外的错误文案
+
+调用方看到的错误只有“状态码 + 固定短语”，例如 `429 usage limit reached`、
+`403 this client is not allowed to use the model`、`502 the upstream gateway failed`。
+上游自己的整句话（包括它的产品名、网址和升级提示）只写进日志，不出现在任何 API
+响应里，`-free` 之类的字样同样不会出现。
+
+未知的上游错误不会退化成透传：归类不出来的失败回答 `NNN the model request failed`，
+没有状态码的回答 `the model request failed`。
+
+自己写的提示照常返回，因为它们只讲怎么修，不提供应商：模型名不存在、请求体校验失败、
+工具调用违约、空响应、`the gateway's front proxy answered HTTP 503 with an HTML error
+page` 等。
+
+日志行形如：
+
+```
+our-free-model: code=LANE_LOCKED status=403 model=deepseek-v4.1-flash-free raw="OpenCode's free tier can only be used from within OpenCode"
+```
+
+`journalctl -u dsh-our-free-model -f | grep 'our-free-model: code='` 可看到全部上游原文。
 
 ## 验证
 

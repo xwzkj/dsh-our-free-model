@@ -36,7 +36,8 @@ import { STATE } from './src/probe.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
 import { chanGatewayCredential, chanGatewayEnabled, chanGatewayPort, startChanRelay } from './src/chan-relay.js'
 import { CODE, UpstreamError } from './src/http.js'
-import { egressActive, egressFetch, outletLabel, readOutletSelection, startEgressRelay } from './src/egress.js'
+import { setFailureLog } from './src/failure.js'
+import { egressActive, egressFetch, outletLabel, readOutletSelection, refreshOutletNodes, startEgressRelay } from './src/egress.js'
 import { directFetch } from './src/eac.js'
 import { clearEacUser, readEacUser, writeEacUser } from './src/eac-user.js'
 import { createEacLoginPoller } from './src/eac-login.js'
@@ -140,6 +141,8 @@ function distributionOf(config, settings) {
 
 export function apply(ctx, config) {
   const logger = ctx.logger ?? console
+  // Callers no longer see the gateway's own words; the log is where they land.
+  setFailureLog(message => logger.warn?.(message))
   const home = resolveDshHome()
   const dataDir = path.resolve(home, DATA_DIR_NAME)
   fs.mkdirSync(dataDir, { recursive: true })
@@ -874,6 +877,8 @@ export function apply(ctx, config) {
       const closing = outletRelay
       outletRelay = null
       outletFingerprint = ''
+      clearInterval(outletMeasureTimer)
+      outletMeasureTimer = null
       await closing.close().catch(() => {})
       // The way out changed under every fetch: re-detect the exit so the pill and
       // the model verdicts describe the path the next request actually takes.
@@ -894,8 +899,13 @@ export function apply(ctx, config) {
           const current = settings.get().egress ?? {}
           return {
             mode: current.mode === 'client' ? 'client' : 'subscription',
+            // Read live by the relay handle: switching policy re-routes the next
+            // attempt without restarting mihomo.
+            policy: current.policy === 'failover' ? 'failover' : 'always',
             url: String(current.url ?? '').trim(),
             mihomoPath: String(current.mihomoPath ?? '').trim(),
+            nodeCooldownHours: current.nodeCooldownHours,
+            maxAttempts: current.maxAttempts,
           }
         },
         dataDir,
@@ -906,6 +916,7 @@ export function apply(ctx, config) {
       outletError = ''
       outletUpSince = Date.now()
       logger.info?.(`our-free-model: egress outlet up (${outletLabel(url)} via ${mode})`)
+      scheduleOutletMeasurement()
       // Same as the close path: the exit IP, its country and the region-gated
       // verdicts all moved with the outlet, so settle them now instead of at the
       // next periodic watch.
@@ -922,6 +933,24 @@ export function apply(ctx, config) {
   // relay with an unchanged fingerprint — this only calls it, with a backoff so
   // a mihomo that dies at boot cannot spin into a start/exit loop. A run that
   // lasted two minutes counts as healthy and resets the ladder.
+  // Measure now, then on the configured interval. The book has to be non-empty
+  // before failover can name a node, and a measurement takes ~15-35 s on a
+  // 71-node subscription — hence background, never on a turn's path.
+  let outletMeasureTimer = null
+  function scheduleOutletMeasurement() {
+    clearInterval(outletMeasureTimer)
+    outletMeasureTimer = null
+    const relay = outletRelay
+    if (relay === null) return
+    void refreshOutletNodes(relay).catch(() => {})
+    const minutes = Number(settings.get().egress?.delayRefreshMinutes)
+    const every = Number.isFinite(minutes) && minutes > 0 ? minutes : 60
+    outletMeasureTimer = setInterval(() => {
+      void refreshOutletNodes(outletRelay).catch(() => {})
+    }, every * 60_000)
+    outletMeasureTimer.unref?.()
+  }
+
   const OUTLET_STABLE_MS = 120_000
   let outletUpSince = 0
   let outletRestartAttempts = 0
@@ -2424,7 +2453,7 @@ function publicSettings(settings, forwardInfo, egressInfo) {
     // set at all, and the value itself is served only by `GET /egress/url`, on
     // the settings page's own ask (see src/egress.js `outletLabel`).
     egress: {
-      ...pick(settings.egress ?? {}, ['enabled', 'mode', 'mihomoPath']),
+      ...pick(settings.egress ?? {}, ['enabled', 'mode', 'policy', 'mihomoPath']),
       hasUrl: String(settings.egress?.url ?? '') !== '',
       urlLabel: outletLabel(settings.egress?.url ?? ''),
       outlet: egressInfo?.outlet ?? '',

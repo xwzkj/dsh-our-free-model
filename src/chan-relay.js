@@ -24,6 +24,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { homedir } from 'node:os'
 import { keyMatches } from './forward.js'
+import { sanitizeErrorMessage } from './failure.js'
 
 /** Request loop breaker: present on hops this relay already forwarded once. */
 const HOP_HEADER = 'x-ofm-chan-relay-hop'
@@ -44,7 +45,7 @@ const corsHeaders = () => ({
 
 function openAiError(res, status, code, message) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify({ error: { message, type: code, code } }))
+  res.end(JSON.stringify({ error: { message: sanitizeErrorMessage(message), type: code, code } }))
 }
 
 /** Match the vendored resolveChannelPackHome order, without moving OFM's data. */
@@ -116,7 +117,7 @@ export async function startChanRelay({ config, log = () => {} }) {
     }
     const settings = config()
     if (!settings.enabled) {
-      openAiError(res, 503, 'service_unavailable', 'the channel-gateway relay is switched off in Our Free Model settings')
+      openAiError(res, 503, 'service_unavailable', 'the channel-gateway relay is switched off in the service settings')
       return
     }
     if (!keyMatches(bearerOf(req), settings.lanKey)) {

@@ -158,7 +158,7 @@ function classifyKilo(status, text, retryAfterMs) {
     },
   }
   if (typeof type === 'string' && /PAID_MODEL_AUTH_REQUIRED/i.test(type)) {
-    return new UpstreamError('this model is not on the free pool: it needs a Kilo account, so it is not served by this channel', CODE.client, { status })
+    return new UpstreamError('this model requires an account and is not available on this channel', CODE.client, { status })
   }
   const failure = classifyFailure(status, shaped, retryAfterMs)
   if (typeof failure.message === 'string' && /moderation|flagged|filtered/i.test(failure.message)) {

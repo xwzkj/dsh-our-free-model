@@ -441,7 +441,10 @@ export async function testProvider(config, providerId, { signal, timeoutMs = LIS
     const body = await response.text().catch(() => '')
     if (!response.ok) {
       const failure = classifyUpstream(response.status, body, retryAfterMs(response), resolved.apiKey)
-      return { ok: false, status: response.status, message: failure.message }
+      // A local button, not a wire reply: the operator pressing "test key" needs
+      // the provider's sentence (already redacted by `postAggregateStreamed`),
+      // and this never leaves the management page.
+      return { ok: false, status: response.status, message: failure.rawMessage ?? failure.message }
     }
     let payload
     try { payload = JSON.parse(redact(body, resolved.apiKey)) } catch { payload = null }

@@ -6,6 +6,8 @@ import crypto from 'node:crypto'
 import { createModelRuntime, createRuntimeStores } from '../../src/core/runtime.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from '../../src/forward.js'
 import { isLoopbackHost } from '../../src/trust.js'
+import { setFailureLog } from '../../src/failure.js'
+import { outletLabel, refreshOutletNodes, startEgressRelay } from '../../src/egress.js'
 import { createManagement } from './management.mjs'
 import { createStandaloneEac } from './eac.mjs'
 import { createChannelRuntime } from './channels/runtime.mjs'
@@ -119,6 +121,8 @@ export async function startStandalone({
   // host, and the update flow has to be exercisable where CI actually runs.
   desktopPlatform = process.platform, desktopArch = process.arch,
 } = {}) {
+  // Callers never read the gateway's own words; the journal keeps them.
+  setFailureLog(message => logger.warn?.(message))
   if (!isLoopbackHost(host)) throw new TypeError('the standalone service binds a loopback address only')
   if (typeof dataDir !== 'string' || !path.isAbsolute(dataDir)) throw new TypeError('dataDir must be an absolute path')
   if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) {
@@ -150,6 +154,11 @@ export async function startStandalone({
   let relayRequestedPort
   let relayError = null
   let relayChanges = Promise.resolve()
+  let outletRelay = null
+  let outletFingerprint = ''
+  let outletError = null
+  let outletChanges = Promise.resolve()
+  let outletTimer = null
   const lanState = () => {
     const value = stores.settings.get()
     const addresses = rankLanAddresses(os.networkInterfaces())
@@ -163,6 +172,81 @@ export async function startStandalone({
       baseUrls: relay ? addresses.map(address => `http://${address}:${relay.port}/v1`) : [],
       error: relayError,
     }
+  }
+  /**
+   * The egress outlet, owned by this service.
+   *
+   * Same shape as the LAN relay beside it: the settings are the source of truth,
+   * a change means restart the outlet, and a failed start is remembered rather
+   * than fatal. `policy` is read live by the handle, so switching between
+   * "everything through the outlet" and "direct first, 429 falls over" does not
+   * take mihomo down.
+   */
+  async function closeOutlet() {
+    clearInterval(outletTimer)
+    outletTimer = null
+    const current = outletRelay
+    outletRelay = null
+    outletFingerprint = ''
+    await current?.close().catch(() => {})
+  }
+  /**
+   * Measure the nodes now and once per interval.
+   *
+   * The first measurement is what makes failover useful at all — without it the
+   * book is empty and the plan has no node to name — so it runs right after
+   * startup, in the background, never on a turn's path.
+   */
+  function scheduleOutletMeasurement() {
+    clearInterval(outletTimer)
+    const relay = outletRelay
+    if (relay === null) return
+    void refreshOutletNodes(relay).catch(() => {})
+    const minutes = Number(stores.settings.get().egress?.delayRefreshMinutes)
+    const every = Number.isFinite(minutes) && minutes > 0 ? minutes : 60
+    outletTimer = setInterval(() => { void refreshOutletNodes(outletRelay).catch(() => {}) }, every * 60_000)
+    outletTimer.unref?.()
+  }
+  function reconcileOutlet() {
+    outletChanges = outletChanges.then(async () => {
+      const value = stores.settings.get().egress ?? {}
+      const mode = value.mode === 'client' ? 'client' : 'subscription'
+      const url = String(value.url ?? '').trim()
+      const mihomoPath = String(value.mihomoPath ?? '').trim()
+      const wanted = !stopped && value.enabled === true && url !== ''
+      const fingerprint = `${mode}\n${url}\n${mihomoPath}`
+      outletError = null
+      if (!wanted) {
+        await closeOutlet()
+        return
+      }
+      if (outletRelay !== null && outletFingerprint === fingerprint && !outletRelay.dead) return
+      await closeOutlet()
+      try {
+        outletRelay = await startEgressRelay({
+          config: () => {
+            const current = stores.settings.get().egress ?? {}
+            return {
+              mode: current.mode === 'client' ? 'client' : 'subscription',
+              policy: current.policy === 'failover' ? 'failover' : 'always',
+              url: String(current.url ?? '').trim(),
+              mihomoPath: String(current.mihomoPath ?? '').trim(),
+              nodeCooldownHours: current.nodeCooldownHours,
+              maxAttempts: current.maxAttempts,
+            }
+          },
+          dataDir,
+          log: message => logger.warn?.(`our-free-model egress: ${message}`),
+        })
+        outletFingerprint = fingerprint
+        logger.warn?.(`our-free-model egress: outlet up (${outletLabel(url)} via ${mode})`)
+        scheduleOutletMeasurement()
+      } catch (error) {
+        outletError = String(error?.message ?? error)
+        logger.warn?.(`our-free-model egress: outlet could not start (${outletError})`)
+      }
+    })
+    return outletChanges
   }
   async function closeRelay() {
     const current = relay
@@ -300,7 +384,7 @@ export async function startStandalone({
       }),
       onSettingsChanged: async () => {
         if (!refreshInFlight) scheduleRefresh()
-        await reconcileRelay()
+        await Promise.all([reconcileRelay(), reconcileOutlet()])
       },
     })
     listener = await startForwardServer({
@@ -329,7 +413,7 @@ export async function startStandalone({
         logger.warn?.('our-free-model standalone: model workspace could not resume')
       })
     }
-    await reconcileRelay()
+    await Promise.all([reconcileRelay(), reconcileOutlet()])
 
     function scheduleRefresh() {
       clearTimeout(timer)
@@ -372,7 +456,8 @@ export async function startStandalone({
         closing = (async () => {
           try {
             await relayChanges
-            await Promise.all([managementClosing, closeRelay(), listener.close(), channels.close(), engineClosing])
+            await outletChanges
+            await Promise.all([managementClosing, closeRelay(), closeOutlet(), listener.close(), channels.close(), engineClosing])
           } finally {
             try { stores.dispose() } finally { await releaseLock() }
           }
@@ -389,7 +474,9 @@ export async function startStandalone({
     await magpieEngine?.close()
     runtime?.dispose()
     await relayChanges
+    await outletChanges
     await closeRelay()
+    await closeOutlet()
     if (listener) await listener.close()
     await channels?.close()
     try { stores?.dispose() } finally { await releaseLock() }

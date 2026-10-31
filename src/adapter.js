@@ -276,7 +276,7 @@ export class FreeModelAdapter {
     }
     if (settings.enabled === false) {
       rejectedTurn(0)
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: 'our free model is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: 'the model service is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
       return
     }
     const candidates = comboChain(entry, snapshot.catalog, snapshot.routing ?? {})
@@ -360,12 +360,12 @@ export class FreeModelAdapter {
 
     if (settings.enabled === false) {
       recordRejectedTurn()
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: 'our free model is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: 'the model service is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
       return { advance: false, verdict: null, ok: false }
     }
     if (entry === null) {
       recordRejectedTurn()
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: `our free model does not serve "${options.model}" on this egress`, code: CODE.server } } }
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: `the model service does not serve "${options.model}" on this egress`, code: CODE.server } } }
       return { advance: false, verdict: null, ok: false }
     }
     if (isSubscriptionEntry(entry)) return yield * this.runSubscription({
@@ -605,7 +605,7 @@ export class FreeModelAdapter {
             if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text.trim() !== '') sawAnswer = true
             // 续写禁用工具；网关不遵守时也不把工具块交给宿主执行。
             if (recovering && (chunk.blockType === 'tool-call' || chunk.type === 'tool-call-delta' || chunk.block?.type === 'tool-call')) {
-              throw new UpstreamError('our free model continuation unexpectedly requested a tool', 'STREAM_CUT')
+              throw new UpstreamError('the continuation unexpectedly requested a tool', 'STREAM_CUT')
             }
             if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta' || chunk.type === 'tool-call-delta') {
               delivered = true
@@ -670,11 +670,11 @@ export class FreeModelAdapter {
           const code = recovering || delivered || outcome.sawToolCall === true ? 'STREAM_CUT'
             : failedEnding ? CODE.server : CODE.transport
           const message = recovering
-            ? `our free model continuation ended without a complete answer after ${seconds}s; automatic recovery exhausted`
-            : failedEnding ? `our free model upstream response ended with status ${outcome.finish}`
+            ? `the continuation ended without a complete answer after ${seconds}s; automatic recovery exhausted`
+            : failedEnding ? `the upstream response ended with status ${outcome.finish}`
             : delivered || outcome.sawToolCall === true
-              ? `our free model closed the stream after ${seconds}s, before its finish token; automatic recovery was not safe`
-              : 'our free model closed the stream before its finish token, without answering; retrying'
+              ? `the stream closed after ${seconds}s, before its finish token; automatic recovery was not safe`
+              : 'the stream closed before its finish token, without answering; retrying'
           record(false, outcome, { truncated: true })
           finishTurn(false, false, attempt + 1)
           yield { type: 'usage', usage: totalUsage }
@@ -685,7 +685,7 @@ export class FreeModelAdapter {
           record(false, outcome)
           finishTurn(false, false, attempt + 1)
           yield { type: 'usage', usage: totalUsage }
-          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'our free model returned an empty response', code: CODE.empty } } }
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'the model returned an empty response', code: CODE.empty } } }
           return { ok: false, ...advanceVerdict(CODE.empty, 'empty response') }
         }
         record(true, outcome, recovering ? { recovered: reason.kind === 'stop' } : {})
@@ -707,8 +707,8 @@ export class FreeModelAdapter {
         if (!aborted && (recovering || expired)) {
           failure = { ...failure, code: recovering || delivered || partialOutcome?.sawToolCall === true ? 'STREAM_CUT' : CODE.timeout,
             message: expired
-              ? `our free model reached its ${Math.round(timeoutMs / 1000)}s time limit before its finish token${recovering ? ', during the continuation from its checkpoint' : ''}`
-              : `our free model continuation failed: ${failure.message}` }
+              ? `the model reached its ${Math.round(timeoutMs / 1000)}s time limit before its finish token${recovering ? ', during the continuation from its checkpoint' : ''}`
+              : `the continuation failed: ${failure.message}` }
         }
         if (!usageAdded) partialOutcome = collectUsage(partialOutcome)
         record(false, partialOutcome, { ...(recovering || expired) ? { truncated: true } : {}, ...aborted ? { aborted: true } : {} })
@@ -895,7 +895,7 @@ function buildPayload(wire, modelId, messages, options, budget, resolveImage, wa
 function toFailure(error) {
   const message = typeof error?.message === 'string' && error.message.length > 0
     ? error.message
-    : String(error ?? 'our free model request failed')
+    : String(error ?? 'the model request failed')
   const code = typeof error?.code === 'string' && error.code.length > 0 ? error.code : CODE.transport
   const status = error?.status
   const retryAfter = error?.providerRetryAfterMs

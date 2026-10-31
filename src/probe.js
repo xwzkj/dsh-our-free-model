@@ -95,7 +95,11 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
   } catch (error) {
     return {
       state: stateOf(error),
-      detail: typeof error?.message === 'string' ? error.message.slice(0, 200) : String(error),
+      // A local diagnostic, shown on this machine's picker — the wire gets the
+      // blurred `message`, this keeps the words that explain the bad judgement.
+      detail: typeof (error?.rawMessage ?? error?.message) === 'string'
+        ? String(error.rawMessage ?? error.message).slice(0, 200)
+        : String(error),
       latencyMs: Date.now() - started,
     }
   }
@@ -165,7 +169,10 @@ function stateOf(error) {
     case CODE.laneLocked: return STATE.unavailable
     default: break
   }
-  const message = String(error?.message ?? '')
+  // The upstream's sentence, not the public one: a refusal the classifier did
+  // not name is recognised here by its words, and `rawMessage` is where those
+  // words now live. This verdict is local (the picker's badge), never a reply.
+  const message = String(error?.rawMessage ?? error?.message ?? '')
   // The message match is a fallback for a refusal the classifier did not name
   // ("no such model", "unknown model"), so it may only speak when the status did
   // not already answer on the gateway's behalf: 503 is spelled "Service
