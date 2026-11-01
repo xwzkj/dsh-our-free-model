@@ -118,9 +118,17 @@ export function noteNode429(table, name, now = Date.now()) {
 /**
  * Candidate node names, best first.
  *
- * Order: measured latency ascending, then unmeasured nodes. Excluded: a 429
- * inside the cooldown window, a failure inside the short window, and anything
- * named in `exclude` (the nodes this turn already tried).
+ * Order: nodes that have never been refused first, then the ones whose 429 is
+ * already past the window; inside each group measured latency ascending, then
+ * unmeasured nodes. Excluded: a 429 inside the cooldown window, a failure inside
+ * the short window, and anything named in `exclude` (the nodes this turn already
+ * tried).
+ *
+ * "Never refused" outranking "refused a while ago" is the fix for the case that
+ * made the pool look broken: the fastest nodes are the ones most likely to be
+ * spent, so a pure latency sort sent every turn to the same exhausted exits and
+ * a working node was only reached after the ladder ran out. Latency breaks ties
+ * inside a group instead of deciding the group.
  *
  * When every node is excluded the caller gets an empty list and decides — this
  * function does not quietly resurrect a spent node, because "pick the least bad
@@ -146,9 +154,13 @@ export function rankNodes(table, {
     const lastFailAt = Number(entry.lastFailAt) || 0
     if (failMs === 0 ? lastFailAt > 0 : lastFailAt > 0 && now - lastFailAt < failMs) continue
     const delayMs = Number(entry.delayMs) || 0
-    ranked.push({ name, delayMs })
+    ranked.push({ name, delayMs, limited: last429At > 0 })
   }
   ranked.sort((a, b) => {
+    // A node that has never been refused outranks one that has, however fast
+    // the latter's last reading: the refusal is evidence about the account
+    // behind that address, the latency is only a hint about the path.
+    if (a.limited !== b.limited) return a.limited ? 1 : -1
     // A measured node always outranks an unmeasured one, however slow: an
     // unmeasured node is one we know nothing about, not one we know is fast.
     if (a.delayMs > 0 && b.delayMs === 0) return -1
@@ -162,10 +174,14 @@ export function rankNodes(table, {
 /**
  * Every path a turn may take, best first — direct included, at latency 0.
  *
- * This is the rule the operator asked for, spelled out: one pool, one ordering
- * (latency), one exclusion (a 429 inside the cooldown window). `direct` carries
- * no latency reading of its own and is never given one; only its 429 stamp
- * matters, because a refused direct connection is exactly what the pool is for.
+ * This is the rule the operator asked for, spelled out: one pool, one ordering,
+ * one exclusion (a 429 inside the cooldown window). `direct` carries no latency
+ * reading of its own and is never given one; only its 429 stamp matters, because
+ * a refused direct connection is exactly what the pool is for.
+ *
+ * Within the pool, a path that has never said 429 leads a path whose refusal is
+ * merely old: an address that has not been tried yet is the better guess, and
+ * the fastest exits are the ones most likely to be spent already.
  *
  * A failed *connection* cools a node for the short window; it never cools
  * `direct`, because a reset on the way out says nothing about our own address.
@@ -184,7 +200,7 @@ export function routeCandidates(table, {
     const direct = table.nodes?.[DIRECT_ROUTE] ?? {}
     const last429At = Number(direct.last429At) || 0
     if (!(cooldownMs === 0 ? last429At > 0 : last429At > 0 && now - last429At < cooldownMs)) {
-      routes.push({ name: DIRECT_ROUTE, delayMs: 0, direct: true })
+      routes.push({ name: DIRECT_ROUTE, delayMs: 0, direct: true, limited: last429At > 0 })
     }
   }
   for (const [name, raw] of Object.entries(table.nodes ?? {})) {
@@ -194,16 +210,27 @@ export function routeCandidates(table, {
     if (cooldownMs === 0 ? last429At > 0 : last429At > 0 && now - last429At < cooldownMs) continue
     const lastFailAt = Number(entry.lastFailAt) || 0
     if (failMs === 0 ? lastFailAt > 0 : lastFailAt > 0 && now - lastFailAt < failMs) continue
-    routes.push({ name, delayMs: Number(entry.delayMs) || 0, direct: false })
+    routes.push({ name, delayMs: Number(entry.delayMs) || 0, direct: false, limited: last429At > 0 })
   }
-  // Direct first, then measured nodes by latency, then everything unmeasured.
+  // Direct leads whenever it is off cooldown — it is the local path, and its
+  // "0 ms" is a policy statement, not a measurement. Among the nodes: never
+  // refused first, then the ones whose 429 is already past the window, and
+  // inside each group measured latency ascending with unmeasured nodes last.
   //
-  // The last group matters: a node whose only reading is a failure has
-  // `delayMs === 0`, and sorting raw numbers put those first — a dead node
-  // ranked ahead of a 200 ms one and every turn went to it. "No measurement" is
-  // the absence of a hint, never a zero latency.
+  // Both extra keys come from the same incident. Latency alone sent every turn
+  // at the fastest nodes, which are the ones most likely to be spent, while
+  // untried ones waited at the bottom of the ladder — the turn then walked ten
+  // refused exits instead of reaching a fresh one. A refusal is evidence about
+  // the account behind an address; latency is only evidence about the path.
+  //
+  // Unmeasured last matters for a different reason: a node whose only reading is
+  // a failure has `delayMs === 0`, and sorting raw numbers put those first — a
+  // dead node ranked ahead of a 200 ms one and every turn went to it. "No
+  // measurement" is the absence of a hint, never a zero latency.
   const rank = route => (route.direct ? -1 : route.delayMs > 0 ? route.delayMs : Number.MAX_SAFE_INTEGER)
   routes.sort((a, b) => {
+    if (a.direct !== b.direct) return a.direct ? -1 : 1
+    if (a.limited !== b.limited) return a.limited ? 1 : -1
     const left = rank(a)
     const right = rank(b)
     if (left !== right) return left - right

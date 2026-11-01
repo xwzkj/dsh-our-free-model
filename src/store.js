@@ -193,8 +193,11 @@ export const SETTINGS_INITIAL = {
    *  default — requests go straight out until this is turned on. */
   egress: {
     enabled: false, mode: 'subscription', policy: 'always', url: '', mihomoPath: '',
-    /** 429 keeps a node out of the running this long; latency is re-measured on `delayRefreshMinutes`. */
-    nodeCooldownHours: 5, delayRefreshMinutes: 60, maxAttempts: 3,
+    /** 429 keeps a node out of the running this long; latency is re-measured on `delayRefreshMinutes`.
+     *  `maxAttempts` is how many exits one turn may try (direct counts as one):
+     *  about two exits in three are out of quota at any moment, so a narrow
+     *  ladder hands back 429s a wider one serves. */
+    nodeCooldownHours: 5, delayRefreshMinutes: 60, maxAttempts: 10,
   },
   /** Expose the absorbed channels' OpenAI gateway (the pack's loopback
    *  listener) to other machines under this plugin's own key. Off by default:

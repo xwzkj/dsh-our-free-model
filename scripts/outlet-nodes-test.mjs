@@ -82,6 +82,30 @@ assert.deepEqual(routeCandidates(pool2, { now }).map(r => r.name), ['direct', 'h
 noteNode429(pool2, 'hk', now - HOUR)
 assert.deepEqual(routeCandidates(pool2, { now }).map(r => r.name), ['direct', 'jp'], 'the limited node drops out, direct is unaffected')
 
+// --- a refusal outranks a fast reading ------------------------------------
+// The ordering that made the pool look broken: the fastest exits are the ones
+// most likely to be spent, so latency alone sent every turn at the same
+// exhausted nodes while untried ones waited at the bottom of the ladder.
+const spent = emptyNodeTable()
+noteNodeDelay(spent, 'fast-but-spent', 180, now)
+noteNodeDelay(spent, 'slow-but-fresh', 900, now)
+noteNode429(spent, 'fast-but-spent', now - 6 * HOUR)   // past the window: eligible again
+assert.deepEqual(rankNodes(spent, { now }), ['slow-but-fresh', 'fast-but-spent'],
+  'a node that has never said 429 leads one that has, however fast that one is')
+
+// Latency still decides inside a group — it is the tiebreak, not the rule.
+noteNodeDelay(spent, 'slow-fresh', 400, now)
+noteNodeDelay(spent, 'fast-fresh', 120, now)
+assert.deepEqual(rankNodes(spent, { now }), ['fast-fresh', 'slow-fresh', 'slow-but-fresh', 'fast-but-spent'])
+
+// The same ordering over the whole pool, with direct in it.
+const spentPool = emptyNodeTable()
+noteNodeDelay(spentPool, 'fast-but-spent', 180, now)
+noteNodeDelay(spentPool, 'slow-but-fresh', 900, now)
+noteNode429(spentPool, 'fast-but-spent', now - 6 * HOUR)
+assert.deepEqual(routeCandidates(spentPool, { now }).map(r => r.name), ['direct', 'slow-but-fresh', 'fast-but-spent'],
+  'a fresh node is tried before a node that was refused hours ago')
+
 // A node whose only reading is a failure must not rank as "0 ms".
 const mixed = emptyNodeTable()
 noteNodeDelay(mixed, 'dead', 0, now - 30 * 60_000)

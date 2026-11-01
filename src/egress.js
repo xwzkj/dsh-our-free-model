@@ -66,6 +66,15 @@ import { restrictPermissions } from './open-external.js'
 
 /** The loopback address the relay listens on. Never a routable one. */
 const RELAY_HOST = '127.0.0.1'
+/**
+ * How many exits one turn may try, when settings say nothing.
+ *
+ * Sized from the pool, not from taste: roughly two exits in three are out of
+ * quota at any moment, so a three-rung ladder fails most turns that a wider one
+ * serves. Twelve is the hard ceiling — past that the turn has spent longer
+ * switching than a fresh request would cost.
+ */
+const DEFAULT_MAX_ATTEMPTS = 10
 /** Carries the absolute target URL from `egressFetch` to the relay. */
 const TARGET_HEADER = 'x-ofm-egress-target'
 /** Carries this start's relay key. Every listen mints one, `egressFetch` is the
@@ -129,7 +138,7 @@ export function egressPolicy() {
 export function outletRoutePlan() {
   const relay = activeRelay
   const cooldownHours = relay?.cooldownHours?.() ?? DEFAULT_COOLDOWN_HOURS
-  const attempts = relay?.maxAttempts?.() ?? 3
+  const attempts = relay?.maxAttempts?.() ?? DEFAULT_MAX_ATTEMPTS
   if (relay === null || relay.dead) return [{ kind: 'direct' }]
   if (egressPolicy() === 'always') {
     const best = rankNodes(relay.nodes, { cooldownHours })[0]
@@ -495,7 +504,13 @@ export async function startEgressRelay({ config, dataDir, log = () => {}, onDead
     },
     maxAttempts: () => {
       const attempts = Number(config().maxAttempts)
-      return Number.isInteger(attempts) && attempts > 0 ? Math.min(attempts, 5) : 3
+      // Ten rungs by default, not three. Measured on this pool: about two exits
+      // in three are already out of quota at any moment, so three rungs is a
+      // coin flip that hands the turn back to the caller — new-api then retries
+      // the whole request and burns three more, and the user sees a 429 that a
+      // wider ladder would have served. The cap is a bound on the worst case,
+      // not a target: a healthy turn still stops at rung one.
+      return Number.isInteger(attempts) && attempts > 0 ? Math.min(attempts, 12) : DEFAULT_MAX_ATTEMPTS
     },
     /** Set when the managed child dies after startup; the settings page shows it. */
     dead: '',

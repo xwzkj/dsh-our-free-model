@@ -62,6 +62,18 @@ export class UpstreamError extends Error {
 }
 
 /**
+ * How long the exit ladder may keep switching after the first refusal.
+ *
+ * A refusal costs no tokens, but it does cost a round-trip, and ten of them on
+ * slow nodes is time the caller is left waiting. Twenty seconds is roughly the
+ * window in which a switched turn still feels like the same answer rather than a
+ * new request; past it the honest move is to report the refusal. This bounds the
+ * *switching*, never a single attempt: the first rung's own deadline is the
+ * caller's signal, untouched.
+ */
+const LADDER_BUDGET_MS = 20_000
+
+/**
  * The socket-level facts behind a transport failure, walked off the error's
  * `cause` chain.
  *
@@ -497,10 +509,31 @@ function emptyBodyFailure(status, retryAfterMs, imageContent) {
  * the request, not of the route.
  */
 export async function postStreamed(options) {
-  const routes = outletRoutePlan()
+  const planned = outletRoutePlan()
+  // A probe asks "is this model servable right now", not "serve this turn": three
+  // exits answer that question, and a probe round is one request per model — ten
+  // rungs each would multiply a 36-model round into 360 refusals for no better
+  // verdict. Real traffic keeps the whole ladder.
+  const rungLimit = Number(options.maxRungs) > 0 ? Math.floor(Number(options.maxRungs)) : planned.length
+  const routes = planned.slice(0, rungLimit)
+  const ladderBudgetMs = Number(options.ladderBudgetMs) > 0 ? Number(options.ladderBudgetMs) : LADDER_BUDGET_MS
   let lastError
+  // When the first rung refused, so the budget below measures the *ladder* and
+  // not the turn: a healthy first attempt may legitimately take minutes, and
+  // charging that to the retries would cancel them before they started.
+  let ladderStartedAt = 0
   for (let index = 0; index < routes.length; index += 1) {
     const route = routes[index]
+    // A wide ladder is only worth having if it stays cheaper than the failure it
+    // replaces: ten rungs of a slow, refused exit can outlast the caller's own
+    // patience and hold the turn past any useful point. So the switching itself
+    // is capped — once the budget is gone the turn reports the last refusal
+    // instead of walking the rest of the list. `ladderBudgetMs` bounds the
+    // switching, never a single attempt.
+    if (index > 0 && ladderStartedAt !== 0 && Date.now() - ladderStartedAt >= ladderBudgetMs) {
+      logFailureNote(`the exit ladder spent its ${Math.round(ladderBudgetMs / 1000)}s budget after ${index} ${index === 1 ? 'exit' : 'exits'}; reporting the last refusal`)
+      throw lastError
+    }
     // Every rung after the first is a different exit, so it also gets a
     // different session id: a spent session is not carried onto a fresh
     // address. The first rung keeps the conversation's own id, so a healthy turn
@@ -542,6 +575,7 @@ export async function postStreamed(options) {
       // cost nothing to retry elsewhere (the rung already replayed itself once).
       const reroutable = error?.status === 429 || error?.beforeHead === true
       if (!reroutable || next === undefined) throw error
+      if (ladderStartedAt === 0) ladderStartedAt = Date.now()
       // The refused attempt spent nothing (nothing was generated), so this is
       // the one retry that is free. The raw sentence is already in the log;
       // this line records which route refused and where the turn goes next.

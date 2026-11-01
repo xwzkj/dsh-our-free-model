@@ -72,6 +72,10 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
       // pool is genuinely spent they would burn every node in seconds — the
       // cascade that left three paths stamped and the roster short.
       probe: true,
+      // And it walks only the first few rungs: "is this model servable" is
+      // answered by three exits, while a full ten-rung ladder per model would
+      // turn one 36-model round into 360 refusals for the same verdict.
+      maxRungs: 3,
       onData: payload => {
         // The lane answers some refusals inside a 200 stream — a `{"type":
         // "error"}` or `{"error": …}` frame arrives where the deltas were

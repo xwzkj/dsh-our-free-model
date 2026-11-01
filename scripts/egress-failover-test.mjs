@@ -71,12 +71,15 @@ process.env.OUR_FREE_MODEL_BASE = `http://127.0.0.1:${upstream.address().port}`
 const { postStreamed } = await import('../src/http.js')
 const { egressPolicy, outletRoutePlan, startEgressRelay } = await import('../src/egress.js')
 const { setFailureLog } = await import('../src/failure.js')
+const { noteNodeDelay } = await import('../src/outlet-nodes.js')
 
 const notes = []
 setFailureLog(line => notes.push(line))
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-failover-'))
 let policy = 'failover'
+/** The live settings the relay reads through; `undefined` means "not configured". */
+let maxAttempts
 let relay = null
 
 const request = (extra = {}) => ({
@@ -88,7 +91,7 @@ const reset = () => { upstreamHits = 0; proxyTunnels = 0; notes.length = 0; sess
 
 try {
   relay = await startEgressRelay({
-    config: () => ({ mode: 'client', policy, url: `http://127.0.0.1:${proxy.address().port}`, mihomoPath: '' }),
+    config: () => ({ mode: 'client', policy, url: `http://127.0.0.1:${proxy.address().port}`, mihomoPath: '', maxAttempts }),
     dataDir,
   })
   assert.equal(egressPolicy(), 'failover', 'the handle reads the live policy')
@@ -147,6 +150,59 @@ try {
     `the route change is logged, got: ${notes.join(' | ')}`)
   assert.ok(notes.some(line => /subscribe to OpenCode Go/.test(line)), 'the raw sentence is in the log')
   assert.ok(!notes.some(line => /retrying over the outlet.*subscribe to OpenCode Go/.test(line)))
+
+  // 6. A ladder is bounded in time, not only in rungs: once the switching budget
+  //    is gone the turn reports the refusal instead of walking the rest of the
+  //    list. Without this, ten rungs of a slow, refused exit outlast the caller.
+  //    Three named nodes give the plan enough rungs for a budget to bite; with
+  //    no managed controller a node rung still leaves over the same relay, so
+  //    each one is a real refused attempt.
+  policy = 'failover'
+  for (const [name, delay] of [['n1', 100], ['n2', 200], ['n3', 300]]) noteNodeDelay(relay.nodes, name, delay)
+  relay.nodes.nodes.direct.last429At = 0
+  assert.equal(outletRoutePlan().length, 4, 'direct plus three nodes: a ladder long enough to be capped')
+  reset()
+  refuseAll = true
+  const before = upstreamHits
+  await assert.rejects(
+    postStreamed(request({ ladderBudgetMs: 1 })),
+    error => error.status === 429,
+    'an exhausted ladder budget reports the last refusal',
+  )
+  assert.ok(upstreamHits - before <= 2, `the budget stops the walk early, got ${upstreamHits - before} attempts`)
+  assert.ok(notes.some(line => /spent its .* budget after .* reporting the last refusal/.test(line)),
+    `the cut-off is in the log, got: ${notes.join(' | ')}`)
+  refuseAll = false
+
+  // 7. The width of the ladder itself. Ten by default, because about two exits
+  //    in three are out of quota at any moment: three rungs handed the caller a
+  //    429 that a wider ladder serves, and new-api then retried the whole turn
+  //    and burned three more. Twelve is the ceiling — an operator may widen the
+  //    ladder, not make a turn unbounded.
+  // Case 6 refused real requests, so those exits now carry a 429 stamp: the plan
+  // is capped by the pool as well, which is why the width is asserted on the
+  // accessor and the plan only for "more than one rung".
+  maxAttempts = undefined
+  assert.equal(relay.maxAttempts(), 10, 'the default is ten exits per turn')
+  assert.ok(outletRoutePlan().length >= 2, 'and the plan offers every candidate it has')
+  maxAttempts = 12
+  assert.equal(relay.maxAttempts(), 12, 'twelve is allowed')
+  maxAttempts = 99
+  assert.equal(relay.maxAttempts(), 12, 'and is the ceiling')
+  maxAttempts = 1
+  assert.equal(relay.maxAttempts(), 1, 'a narrow ladder is still the operator\'s call')
+  // 8. A probe asks a narrower question, so it gets a narrower ladder: three
+  //    exits answer "is this model servable", and one probe round is a request
+  //    per model — a ten-rung ladder there multiplies refusals, not answers.
+  reset()
+  refuseAll = true
+  const probeBefore = upstreamHits
+  const stampedBefore = relay.nodes.nodes.direct.last429At
+  await assert.rejects(postStreamed(request({ probe: true, maxRungs: 3 })), error => error.status === 429)
+  assert.ok(upstreamHits - probeBefore <= 3, `a probe stops after three rungs, got ${upstreamHits - probeBefore}`)
+  assert.equal(relay.nodes.nodes.direct.last429At, stampedBefore, 'and still stamps nothing')
+  refuseAll = false
+  maxAttempts = undefined
 } finally {
   if (relay !== null) await relay.close().catch(() => {})
   proxy.closeAllConnections?.()

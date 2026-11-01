@@ -81,6 +81,7 @@
     "src/recovery.js",
     "src/reload.js",
     "src/session-affinity.js",
+    "src/outlet-nodes.js",
     "src/store.js",
     "src/stream.js",
     "src/subscription-adapter.js",
